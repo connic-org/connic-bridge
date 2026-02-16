@@ -12,7 +12,7 @@ to the Connic relay. No inbound firewall rules required.
 docker run -d --name connic-bridge \
   -e BRIDGE_TOKEN=cbr_your_token_here \
   -e ALLOWED_HOSTS=kafka:9092,postgres:5432 \
-  connic/bridge:latest
+  connicorg/bridge:latest
 ```
 
 ### pip
