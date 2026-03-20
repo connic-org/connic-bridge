@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "connic-bridge"
-version = "0.1.0"
+version = "0.1.1"
 description = "Connic Bridge - connect private networks to Connic Cloud"
 readme = "README.md"
 requires-python = ">=3.10"
