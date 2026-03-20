@@ -81,7 +81,7 @@ def main():
         print("Use --allow host:port or set ALLOWED_HOSTS env var.")
 
     # Run
-    print(f"Connic Bridge starting...")
+    print("Connic Bridge starting...")
     print(f"  Relay:         {args.relay_url}")
     print(f"  Allowed hosts: {', '.join(sorted(allowed_hosts)) or '(none)'}")
 

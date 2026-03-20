@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import signal
-import sys
 from typing import Dict, Optional, Set
 
 import websockets
