@@ -119,8 +119,8 @@ class BridgeAgent:
         msg_type = ctrl.get("type")
 
         if msg_type == "welcome":
-            project_id = ctrl.get("project_id", "unknown")
-            logger.info(f"Bridge authenticated for project {project_id}")
+            bridge_id = ctrl.get("bridge_id", "unknown")
+            logger.info(f"Bridge authenticated (bridge_id={bridge_id})")
             logger.info(f"Allowed hosts: {', '.join(sorted(self.allowed_hosts))}")
 
         elif msg_type == "connect":
