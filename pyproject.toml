@@ -21,7 +21,13 @@ classifiers = [
     "Topic :: System :: Networking",
 ]
 dependencies = [
-    "websockets>=12.0",
+    "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
 ]
 
 [project.urls]
@@ -34,3 +40,9 @@ connic-bridge = "connic_bridge.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["connic_bridge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+omit = ["*/tests/*"]
