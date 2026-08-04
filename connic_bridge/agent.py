@@ -97,23 +97,31 @@ class BridgeAgent:
             self._ws = ws
             logger.info("Connected to relay")
 
-            async for message in ws:
-                if isinstance(message, str):
-                    # Control message (JSON)
-                    try:
-                        ctrl = json.loads(message)
-                    except json.JSONDecodeError:
-                        logger.warning("Received invalid JSON")
-                        continue
-                    await self._handle_control(ctrl)
+            try:
+                async for message in ws:
+                    if isinstance(message, str):
+                        # Control message (JSON)
+                        try:
+                            ctrl = json.loads(message)
+                        except json.JSONDecodeError:
+                            logger.warning("Received invalid JSON")
+                            continue
+                        await self._handle_control(ctrl)
 
-                elif isinstance(message, bytes):
-                    # Data frame: first 36 bytes = channel UUID
-                    if len(message) < 36:
-                        continue
-                    channel_id = message[:36].decode("utf-8")
-                    payload = message[36:]
-                    await self._handle_data(channel_id, payload)
+                    elif isinstance(message, bytes):
+                        # Data frame: first 36 bytes = channel UUID
+                        if len(message) < 36:
+                            continue
+                        channel_id = message[:36].decode("utf-8")
+                        payload = message[36:]
+                        await self._handle_data(channel_id, payload)
+            finally:
+                self._ws = None
+                tasks = list(self._channel_tasks.values())
+                for channel_id in set(self._channels) | set(self._channel_tasks):
+                    await self._close_channel(channel_id)
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _handle_control(self, ctrl: dict):
         msg_type = ctrl.get("type")
@@ -218,7 +226,7 @@ class BridgeAgent:
                 pass
 
         task = self._channel_tasks.pop(channel_id, None)
-        if task and not task.done():
+        if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
 
         # Notify relay

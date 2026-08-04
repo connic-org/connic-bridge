@@ -39,9 +39,9 @@ class ScriptedRelaySocket(RelaySocket):
         return self
 
     async def __anext__(self):
+        await asyncio.sleep(0)
         if not self._messages:
             raise StopAsyncIteration
-        await asyncio.sleep(0)
         return self._messages.pop(0)
 
 
@@ -431,6 +431,41 @@ def test_connect_and_serve_processes_relay_control_and_data_frames(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_connect_and_serve_closes_idle_tcp_channel_when_relay_disconnects(monkeypatch):
+    async def scenario():
+        service = IdleTcpService()
+        agent = None
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", service.connect)
+        try:
+            relay = ScriptedRelaySocket([
+                json.dumps({
+                    "type": "connect",
+                    "channel": CHANNEL_ID,
+                    "host": service.host,
+                    "port": service.port,
+                }),
+            ])
+            monkeypatch.setattr(agent_module.websockets, "connect", lambda *_args, **_kwargs: relay)
+            agent = BridgeAgent(
+                "wss://relay.example/tunnel",
+                "cbr_test",
+                {f"{service.host}:{service.port}"},
+            )
+
+            await agent._connect_and_serve()
+
+            assert service.closed.is_set()
+            assert agent._channels == {}
+            assert agent._channel_tasks == {}
+            assert agent._ws is None
+        finally:
+            if agent:
+                await agent.stop()
+            await service.close()
+
+    asyncio.run(scenario())
+
+
 async def wait_for_binary_frame(relay):
     deadline = asyncio.get_running_loop().time() + 1
     while asyncio.get_running_loop().time() < deadline:
@@ -728,6 +763,49 @@ def test_forward_tcp_to_relay_handles_eof():
         await agent._forward_tcp_to_relay(CHANNEL_ID, EofReader())
 
         assert CHANNEL_ID not in agent._channels
+
+    asyncio.run(scenario())
+
+
+def test_tcp_eof_notifies_relay_without_cancelling_forwarder(monkeypatch):
+    async def scenario():
+        class YieldingRelaySocket(RelaySocket):
+            async def send(self, message):
+                await asyncio.sleep(0)
+                await super().send(message)
+
+        service = IdleTcpService()
+        relay = YieldingRelaySocket()
+        agent = BridgeAgent(
+            "wss://relay.example",
+            "cbr_test",
+            {f"{service.host}:{service.port}"},
+        )
+        agent._ws = relay
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", service.connect)
+        try:
+            await agent._handle_control({
+                "type": "connect",
+                "channel": CHANNEL_ID,
+                "host": service.host,
+                "port": service.port,
+            })
+            forwarder = agent._channel_tasks[CHANNEL_ID]
+
+            await service._reader.feed_eof()
+            await forwarder
+
+            assert forwarder.cancelled() is False
+            assert service.closed.is_set()
+            assert agent._channels == {}
+            assert agent._channel_tasks == {}
+            assert [decode_control(message) for message in relay.sent] == [
+                {"type": "connected", "channel": CHANNEL_ID},
+                {"type": "close", "channel": CHANNEL_ID},
+            ]
+        finally:
+            await agent.stop()
+            await service.close()
 
     asyncio.run(scenario())
 

@@ -47,10 +47,21 @@ connic-bridge \
   local TCP connection, and proxies data bidirectionally.
 4. All traffic is encrypted via WSS (TLS).
 
+## Connect Services That Discover Endpoints
+
+Some clients receive a different hostname or IP address after their first
+connection. Automatic destination routes send those follow-up connections
+through the correct bridge without requiring changes to your client code.
+
+Configure routes under **Project Settings → Bridge**, and add every permitted
+`host:port` to `ALLOWED_HOSTS`.
+
+See [the automatic destination routes guide](https://connic.co/docs/v1/platform/bridge#use-tools-middlewares)
+for setup instructions, API usage, supported patterns, and limits.
+
 ## Security
 
 - **Outbound-only** - the bridge never accepts inbound connections.
 - **Allowed hosts** - you control exactly which services the bridge can reach.
 - **Token authentication** - each bridge is tied to a single Connic project.
 - **TLS encryption** - all relay communication uses WSS.
-
