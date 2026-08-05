@@ -40,6 +40,7 @@ class BridgeAgent:
         self._ws: Optional[ClientConnection] = None
         self._channels: Dict[str, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
         self._channel_tasks: Dict[str, asyncio.Task] = {}
+        self._reconnect_task: Optional[asyncio.Task] = None
         self._running = False
 
     async def run(self):
@@ -75,12 +76,21 @@ class BridgeAgent:
 
             if self._running:
                 logger.info(f"Reconnecting in {delay}s...")
-                await asyncio.sleep(delay)
+                self._reconnect_task = asyncio.create_task(asyncio.sleep(delay))
+                try:
+                    await self._reconnect_task
+                except asyncio.CancelledError:
+                    if self._running:
+                        raise
+                finally:
+                    self._reconnect_task = None
                 delay = min(delay * 2, max_delay)
 
     async def stop(self):
         """Gracefully shut down the agent."""
         self._running = False
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
         # Close all channels
         for channel_id in list(self._channels.keys()):
             await self._close_channel(channel_id)

@@ -573,6 +573,70 @@ def test_run_retries_on_connection_error_then_stops(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_stop_interrupts_maximum_reconnect_backoff(monkeypatch):
+    async def scenario():
+        backoff_started = asyncio.Event()
+        backoff_cancelled = asyncio.Event()
+        delays = []
+
+        async def fail_to_connect(self):
+            raise ConnectionError("relay unavailable")
+
+        async def controlled_sleep(seconds):
+            delays.append(seconds)
+            if seconds < 60:
+                return
+            backoff_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                backoff_cancelled.set()
+                raise
+
+        monkeypatch.setattr(agent_module.asyncio, "sleep", controlled_sleep)
+        monkeypatch.setattr(BridgeAgent, "_connect_and_serve", fail_to_connect)
+        agent = BridgeAgent("wss://relay.example", "cbr_test", {"postgres:5432"})
+        run_task = asyncio.create_task(agent.run())
+
+        await asyncio.wait_for(backoff_started.wait(), timeout=1)
+        await agent.stop()
+        await asyncio.wait_for(run_task, timeout=0.1)
+
+        assert delays == [2, 4, 8, 16, 32, 60]
+        assert backoff_cancelled.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_run_during_reconnect_backoff_propagates(monkeypatch):
+    async def scenario():
+        backoff_started = asyncio.Event()
+
+        async def fail_to_connect(self):
+            raise ConnectionError("relay unavailable")
+
+        async def controlled_sleep(seconds):
+            assert seconds == 2
+            backoff_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(agent_module.asyncio, "sleep", controlled_sleep)
+        monkeypatch.setattr(BridgeAgent, "_connect_and_serve", fail_to_connect)
+        agent = BridgeAgent("wss://relay.example", "cbr_test", {"postgres:5432"})
+        run_task = asyncio.create_task(agent.run())
+
+        await asyncio.wait_for(backoff_started.wait(), timeout=1)
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+
+        assert run_task.cancelled()
+
+    asyncio.run(scenario())
+
+
 def test_run_retries_on_unexpected_error_with_exponential_backoff(monkeypatch):
     """Unexpected errors trigger retry with exponential backoff."""
     async def scenario():
