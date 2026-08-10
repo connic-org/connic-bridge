@@ -4,6 +4,7 @@ import signal
 from unittest.mock import MagicMock
 
 import websockets.exceptions
+from websockets.frames import Close
 
 import connic_bridge.agent as agent_module
 from connic_bridge.agent import BridgeAgent
@@ -367,13 +368,18 @@ def test_relay_close_request_closes_tcp_channel_and_notifies_relay(monkeypatch):
                 "port": service.port,
             })
             await asyncio.wait_for(service.connected.wait(), timeout=1)
+            forwarder = agent._channel_tasks[CHANNEL_ID]
 
             await agent._handle_control({"type": "close", "channel": CHANNEL_ID})
+            await forwarder
 
             await asyncio.wait_for(service.closed.wait(), timeout=1)
             assert CHANNEL_ID not in agent._channels
             assert CHANNEL_ID not in agent._channel_tasks
-            assert decode_control(relay.sent[-1]) == {"type": "close", "channel": CHANNEL_ID}
+            assert [decode_control(message) for message in relay.sent] == [
+                {"type": "connected", "channel": CHANNEL_ID},
+                {"type": "close", "channel": CHANNEL_ID},
+            ]
         finally:
             await agent.stop()
             await service.close()
@@ -427,6 +433,34 @@ def test_connect_and_serve_processes_relay_control_and_data_frames(monkeypatch):
             if agent:
                 await agent.stop()
             await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_connect_and_serve_preserves_relay_url_query_parameters(monkeypatch):
+    async def scenario():
+        relay = ScriptedRelaySocket([])
+        connect_calls = []
+
+        def fake_connect(url, **kwargs):
+            connect_calls.append((url, kwargs))
+            return relay
+
+        monkeypatch.setattr(agent_module.websockets, "connect", fake_connect)
+        agent = BridgeAgent(
+            "wss://relay.example/tunnel?region=eu",
+            "cbr_test",
+            {"postgres:5432"},
+        )
+
+        await agent._connect_and_serve()
+
+        assert connect_calls == [
+            (
+                "wss://relay.example/tunnel?region=eu&token=cbr_test",
+                {"ping_interval": 30, "ping_timeout": 10},
+            )
+        ]
 
     asyncio.run(scenario())
 
@@ -536,6 +570,34 @@ def test_run_stops_immediately_on_auth_failure_401(monkeypatch):
         await agent.run()
 
         assert call_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_run_stops_immediately_when_relay_revokes_active_token(monkeypatch):
+    async def scenario():
+        call_count = 0
+        reconnect_delays = []
+
+        async def fake_connect_and_serve(self):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                close = Close(4003, "Bridge token revoked")
+                raise websockets.exceptions.ConnectionClosedError(close, close, True)
+            self._running = False
+
+        async def record_sleep(seconds):
+            reconnect_delays.append(seconds)
+
+        monkeypatch.setattr(agent_module.asyncio, "sleep", record_sleep)
+        monkeypatch.setattr(BridgeAgent, "_connect_and_serve", fake_connect_and_serve)
+        agent = BridgeAgent("wss://relay.example", "cbr_revoked", {"postgres:5432"})
+
+        await agent.run()
+
+        assert call_count == 1
+        assert reconnect_delays == []
 
     asyncio.run(scenario())
 
@@ -738,7 +800,7 @@ def test_run_retries_on_rejected_connection_non_auth_status(monkeypatch):
 
 
 def test_run_retries_on_connection_closed(monkeypatch):
-    """websockets.ConnectionClosed triggers reconnection."""
+    """A non-auth WebSocket close triggers reconnection."""
     async def scenario():
         call_count = 0
 
@@ -746,6 +808,9 @@ def test_run_retries_on_connection_closed(monkeypatch):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
+                close = Close(1011, "Relay unavailable")
+                raise websockets.exceptions.ConnectionClosedError(close, close, True)
+            if call_count == 2:
                 raise websockets.exceptions.ConnectionClosed(None, None)
             self._running = False
 
@@ -761,7 +826,8 @@ def test_run_retries_on_connection_closed(monkeypatch):
         agent = BridgeAgent("wss://relay.example", "cbr_test", {"postgres:5432"})
         await agent.run()
 
-        assert call_count == 2
+        assert call_count == 3
+        assert sleeps == [2, 4]
 
     asyncio.run(scenario())
 
@@ -827,6 +893,28 @@ def test_forward_tcp_to_relay_handles_eof():
         await agent._forward_tcp_to_relay(CHANNEL_ID, EofReader())
 
         assert CHANNEL_ID not in agent._channels
+
+    asyncio.run(scenario())
+
+
+def test_forward_tcp_to_relay_drops_late_data_after_relay_disconnect():
+    async def scenario():
+        service = IdleTcpService()
+        reader, writer = await service.connect(service.host, service.port)
+        await reader.feed_data(b"late response")
+        await reader.feed_eof()
+
+        agent = BridgeAgent(
+            "wss://relay.example",
+            "cbr_test",
+            {f"{service.host}:{service.port}"},
+        )
+        agent._channels[CHANNEL_ID] = (reader, writer)
+
+        await agent._forward_tcp_to_relay(CHANNEL_ID, reader)
+
+        assert service.closed.is_set()
+        assert agent._channels == {}
 
     asyncio.run(scenario())
 

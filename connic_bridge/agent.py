@@ -10,6 +10,7 @@ import json
 import logging
 import signal
 from typing import Dict, Optional, Set
+from urllib.parse import urlencode, urlsplit
 
 import websockets
 from websockets.asyncio.client import ClientConnection
@@ -69,7 +70,15 @@ class BridgeAgent:
                     )
                     return
                 logger.error(f"Connection rejected (HTTP {status}), retrying in {delay}s...")
-            except (ConnectionError, OSError, websockets.exceptions.ConnectionClosed) as e:
+            except websockets.exceptions.ConnectionClosed as e:
+                if e.rcvd is not None and e.rcvd.code == 4003:
+                    logger.error(
+                        "Authentication failed: the bridge token was rejected by the relay. "
+                        "Please check that BRIDGE_TOKEN is set correctly."
+                    )
+                    return
+                logger.warning(f"Connection lost: {e}")
+            except (ConnectionError, OSError) as e:
                 logger.warning(f"Connection lost: {e}")
             except Exception as e:
                 logger.error(f"Unexpected error: {e}")
@@ -100,7 +109,10 @@ class BridgeAgent:
 
     async def _connect_and_serve(self):
         """Connect to relay and process messages."""
-        url = f"{self.relay_url}?token={self.token}"
+        relay_url = urlsplit(self.relay_url)
+        token_query = urlencode({"token": self.token})
+        query = f"{relay_url.query}&{token_query}" if relay_url.query else token_query
+        url = relay_url._replace(query=query).geturl()
         logger.info(f"Connecting to relay: {self.relay_url}")
 
         async with websockets.connect(url, ping_interval=30, ping_timeout=10) as ws:
@@ -227,6 +239,10 @@ class BridgeAgent:
     async def _close_channel(self, channel_id: str):
         """Close a tunnel channel and clean up."""
         pair = self._channels.pop(channel_id, None)
+        task = self._channel_tasks.pop(channel_id, None)
+        if pair is None and task is None:
+            return
+
         if pair:
             _, writer = pair
             try:
@@ -235,7 +251,6 @@ class BridgeAgent:
             except Exception:
                 pass
 
-        task = self._channel_tasks.pop(channel_id, None)
         if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
 

@@ -45,5 +45,10 @@ include = ["connic_bridge*"]
 testpaths = ["tests"]
 
 [tool.coverage.run]
+branch = true
 source = ["connic_bridge"]
 omit = ["*/tests/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
