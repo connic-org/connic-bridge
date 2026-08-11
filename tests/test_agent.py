@@ -4,6 +4,7 @@ import signal
 from unittest.mock import MagicMock
 
 import websockets.exceptions
+from websockets.asyncio.server import serve
 from websockets.frames import Close
 
 import connic_bridge.agent as agent_module
@@ -80,6 +81,23 @@ class IdleTcpService:
     async def close(self):
         if self._reader:
             await self._reader.feed_eof()
+
+
+class PendingTcpService:
+    def __init__(self):
+        self.host = "unreachable.internal"
+        self.port = 5432
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def connect(self, host, port):
+        assert (host, port) == (self.host, self.port)
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
 
 
 class QueueReader:
@@ -389,12 +407,20 @@ def test_relay_close_request_closes_tcp_channel_and_notifies_relay(monkeypatch):
 
 def test_connect_and_serve_processes_relay_control_and_data_frames(monkeypatch):
     async def scenario():
+        class RelayFollowingConnectHandshake(ScriptedRelaySocket):
+            async def __anext__(self):
+                message = await super().__anext__()
+                if isinstance(message, bytes) and len(message) >= 36:
+                    await wait_for_control(self, "connected")
+                return message
+
         service = RecordingTcpService()
         agent = None
         monkeypatch.setattr(agent_module.asyncio, "open_connection", service.connect)
         try:
-            relay = ScriptedRelaySocket([
+            relay = RelayFollowingConnectHandshake([
                 json.dumps({"type": "welcome", "bridge_id": "bridge_test"}),
+                json.dumps({"type": "heartbeat"}),
                 "not-json",
                 b"short",
                 json.dumps({
@@ -437,6 +463,192 @@ def test_connect_and_serve_processes_relay_control_and_data_frames(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_slow_connect_does_not_block_data_and_relay_close_cancels_it(monkeypatch):
+    async def scenario():
+        existing_channel_id = "87654321-4321-8765-4321-876543218765"
+        pending_service = PendingTcpService()
+
+        class CloseAfterDataRelay(ScriptedRelaySocket):
+            async def __anext__(self):
+                if not self._messages:
+                    assert pending_service.cancelled.is_set()
+                return await super().__anext__()
+
+        class ExistingWriter:
+            def __init__(self):
+                self.received = []
+                self.closed = False
+
+            def write(self, data):
+                self.received.append(data)
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+            async def wait_closed(self):
+                pass
+
+        relay = CloseAfterDataRelay([
+            json.dumps({
+                "type": "connect",
+                "channel": CHANNEL_ID,
+                "host": pending_service.host,
+                "port": pending_service.port,
+            }),
+            existing_channel_id.encode("utf-8") + b"healthcheck",
+            json.dumps({"type": "close", "channel": CHANNEL_ID}),
+        ])
+        writer = ExistingWriter()
+        agent = BridgeAgent(
+            "wss://relay.example/tunnel",
+            "cbr_test",
+            {f"{pending_service.host}:{pending_service.port}"},
+        )
+        agent._channels[existing_channel_id] = (object(), writer)
+        monkeypatch.setattr(
+            agent_module.asyncio,
+            "open_connection",
+            pending_service.connect,
+        )
+        monkeypatch.setattr(
+            agent_module.websockets,
+            "connect",
+            lambda *_args, **_kwargs: relay,
+        )
+
+        await asyncio.wait_for(agent._connect_and_serve(), timeout=1)
+
+        assert pending_service.started.is_set()
+        assert pending_service.cancelled.is_set()
+        assert writer.received == [b"healthcheck"]
+        assert writer.closed is True
+        assert agent._pending_connect_tasks == {}
+
+    asyncio.run(scenario())
+
+
+def test_stop_cancels_in_flight_target_connect(monkeypatch):
+    async def scenario():
+        pending_service = PendingTcpService()
+        relay = RelaySocket()
+        monkeypatch.setattr(
+            agent_module.asyncio,
+            "open_connection",
+            pending_service.connect,
+        )
+        agent = BridgeAgent(
+            "wss://relay.example/tunnel",
+            "cbr_test",
+            {f"{pending_service.host}:{pending_service.port}"},
+        )
+        agent._ws = relay
+
+        await agent._dispatch_control({
+            "type": "connect",
+            "channel": CHANNEL_ID,
+            "host": pending_service.host,
+            "port": pending_service.port,
+        })
+
+        await asyncio.wait_for(pending_service.started.wait(), timeout=1)
+        await asyncio.wait_for(agent.stop(), timeout=1)
+
+        await agent._dispatch_control({
+            "type": "connect",
+            "channel": "22222222-2222-2222-2222-222222222222",
+            "host": pending_service.host,
+            "port": pending_service.port,
+        })
+
+        assert pending_service.cancelled.is_set()
+        assert relay.closed is True
+        assert agent._pending_connect_tasks == {}
+
+    asyncio.run(scenario())
+
+
+def test_relay_disconnect_during_connect_ack_closes_local_target(monkeypatch):
+    async def scenario():
+        class DisconnectedRelaySocket(RelaySocket):
+            async def send(self, _message):
+                raise ConnectionError("relay disconnected")
+
+        service = IdleTcpService()
+        relay = DisconnectedRelaySocket()
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", service.connect)
+        agent = BridgeAgent(
+            "wss://relay.example/tunnel",
+            "cbr_test",
+            {f"{service.host}:{service.port}"},
+        )
+        agent._ws = relay
+
+        await agent._dispatch_control({
+            "type": "connect",
+            "channel": CHANNEL_ID,
+            "host": service.host,
+            "port": service.port,
+        })
+        task = agent._pending_connect_tasks[CHANNEL_ID]
+        await task
+        await asyncio.sleep(0)
+
+        assert service.closed.is_set()
+        assert agent._pending_connect_tasks == {}
+        assert agent._channels == {}
+
+    asyncio.run(scenario())
+
+
+def test_relay_close_during_connect_ack_closes_local_target(monkeypatch):
+    async def scenario():
+        class BlockingAckRelaySocket(RelaySocket):
+            def __init__(self):
+                super().__init__()
+                self.ack_started = asyncio.Event()
+
+            async def send(self, message):
+                if decode_control(message).get("type") == "connected":
+                    self.ack_started.set()
+                    await asyncio.Event().wait()
+                await super().send(message)
+
+        service = IdleTcpService()
+        relay = BlockingAckRelaySocket()
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", service.connect)
+        agent = BridgeAgent(
+            "wss://relay.example/tunnel",
+            "cbr_test",
+            {f"{service.host}:{service.port}"},
+        )
+        agent._ws = relay
+
+        await agent._dispatch_control({
+            "type": "connect",
+            "channel": CHANNEL_ID,
+            "host": service.host,
+            "port": service.port,
+        })
+        await asyncio.wait_for(relay.ack_started.wait(), timeout=1)
+        await asyncio.wait_for(
+            agent._dispatch_control({"type": "close", "channel": CHANNEL_ID}),
+            timeout=1,
+        )
+
+        assert service.closed.is_set()
+        assert agent._pending_connect_tasks == {}
+        assert agent._channels == {}
+        assert agent._channel_tasks == {}
+        assert [decode_control(message) for message in relay.sent] == [
+            {"type": "close", "channel": CHANNEL_ID},
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_connect_and_serve_preserves_relay_url_query_parameters(monkeypatch):
     async def scenario():
         relay = ScriptedRelaySocket([])
@@ -461,6 +673,98 @@ def test_connect_and_serve_preserves_relay_url_query_parameters(monkeypatch):
                 {"ping_interval": 30, "ping_timeout": 10},
             )
         ]
+
+    asyncio.run(scenario())
+
+
+def test_connect_and_serve_proxies_postgres_ssl_request_over_real_sockets():
+    async def scenario():
+        ssl_request = b"\x00\x00\x00\x08\x04\xd2\x16\x2f"
+        ssl_response = b"N"
+        tcp_closed = asyncio.Event()
+        tcp_request = asyncio.get_running_loop().create_future()
+        relay_done = asyncio.get_running_loop().create_future()
+
+        async def postgres_server(reader, writer):
+            try:
+                request = await reader.readexactly(len(ssl_request))
+                tcp_request.set_result(request)
+                writer.write(ssl_response)
+                await writer.drain()
+                await reader.read()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                tcp_closed.set()
+
+        tcp_server = await asyncio.start_server(postgres_server, "127.0.0.1", 0)
+        tcp_port = tcp_server.sockets[0].getsockname()[1]
+        target = f"127.0.0.1:{tcp_port}"
+
+        async def relay_server(connection):
+            try:
+                path = connection.request.path
+                await connection.send(json.dumps({
+                    "type": "welcome",
+                    "bridge_id": "bridge_integration",
+                }))
+                await connection.send(json.dumps({
+                    "type": "connect",
+                    "channel": CHANNEL_ID,
+                    "host": "127.0.0.1",
+                    "port": tcp_port,
+                }))
+                connected = decode_control(await connection.recv())
+
+                await connection.send(CHANNEL_ID.encode("utf-8") + ssl_request)
+                response_frame = await connection.recv()
+
+                await connection.send(json.dumps({
+                    "type": "close",
+                    "channel": CHANNEL_ID,
+                }))
+                close = decode_control(await connection.recv())
+                relay_done.set_result((path, connected, response_frame, close))
+            except Exception as error:
+                if not relay_done.done():
+                    relay_done.set_exception(error)
+
+        agent = None
+        agent_task = None
+        try:
+            async with serve(relay_server, "127.0.0.1", 0) as websocket_server:
+                relay_port = websocket_server.sockets[0].getsockname()[1]
+                agent = BridgeAgent(
+                    f"ws://127.0.0.1:{relay_port}/bridge?region=eu",
+                    "cbr_integration_token",
+                    {target},
+                )
+                agent_task = asyncio.create_task(agent._connect_and_serve())
+
+                path, connected, response_frame, close = await asyncio.wait_for(
+                    relay_done,
+                    timeout=2,
+                )
+                await asyncio.wait_for(agent_task, timeout=2)
+
+            request = await asyncio.wait_for(tcp_request, timeout=2)
+            await asyncio.wait_for(tcp_closed.wait(), timeout=2)
+            assert path == "/bridge?region=eu&token=cbr_integration_token"
+            assert connected == {"type": "connected", "channel": CHANNEL_ID}
+            assert request == ssl_request
+            assert response_frame == CHANNEL_ID.encode("utf-8") + ssl_response
+            assert close == {"type": "close", "channel": CHANNEL_ID}
+            assert agent.allowed_hosts == {target}
+            assert agent._channels == {}
+            assert agent._channel_tasks == {}
+            assert agent._ws is None
+        finally:
+            if agent:
+                await agent.stop()
+            if agent_task:
+                await asyncio.gather(agent_task, return_exceptions=True)
+            tcp_server.close()
+            await tcp_server.wait_closed()
 
     asyncio.run(scenario())
 

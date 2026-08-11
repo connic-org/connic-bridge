@@ -22,7 +22,7 @@ def test_cli_combines_allowed_hosts_from_environment_and_repeated_flags(monkeypa
         [
             "connic-bridge",
             "--allow",
-            "redis:6379, kafka:9092",
+            "redis:6379, kafka:9092,",
             "--allow",
             "my-db:5432",
             "--log-level",

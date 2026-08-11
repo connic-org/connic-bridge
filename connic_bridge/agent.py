@@ -41,12 +41,15 @@ class BridgeAgent:
         self._ws: Optional[ClientConnection] = None
         self._channels: Dict[str, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
         self._channel_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_connect_tasks: Dict[str, asyncio.Task] = {}
         self._reconnect_task: Optional[asyncio.Task] = None
         self._running = False
+        self._stopping = False
 
     async def run(self):
         """Main loop with automatic reconnection."""
         self._running = True
+        self._stopping = False
         base_delay = 2
         max_delay = 60
         delay = base_delay
@@ -98,8 +101,10 @@ class BridgeAgent:
     async def stop(self):
         """Gracefully shut down the agent."""
         self._running = False
+        self._stopping = True
         if self._reconnect_task:
             self._reconnect_task.cancel()
+        await self._cancel_pending_connects()
         # Close all channels
         for channel_id in list(self._channels.keys()):
             await self._close_channel(channel_id)
@@ -128,7 +133,7 @@ class BridgeAgent:
                         except json.JSONDecodeError:
                             logger.warning("Received invalid JSON")
                             continue
-                        await self._handle_control(ctrl)
+                        await self._dispatch_control(ctrl)
 
                     elif isinstance(message, bytes):
                         # Data frame: first 36 bytes = channel UUID
@@ -139,11 +144,59 @@ class BridgeAgent:
                         await self._handle_data(channel_id, payload)
             finally:
                 self._ws = None
+                await self._cancel_pending_connects()
                 tasks = list(self._channel_tasks.values())
                 for channel_id in set(self._channels) | set(self._channel_tasks):
                     await self._close_channel(channel_id)
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _dispatch_control(self, ctrl: dict):
+        if self._stopping:
+            return
+        if ctrl.get("type") != "connect":
+            await self._handle_control(ctrl)
+            return
+
+        channel_id = ctrl["channel"]
+        await self._cancel_pending_connects(channel_id)
+        task = asyncio.create_task(
+            self._open_channel_in_background(channel_id, ctrl["host"], ctrl["port"])
+        )
+        self._pending_connect_tasks[channel_id] = task
+        task.add_done_callback(
+            lambda done, channel_id=channel_id: self._forget_pending_connect(
+                channel_id, done
+            )
+        )
+
+    async def _open_channel_in_background(
+        self, channel_id: str, host: str, port: int
+    ):
+        try:
+            await self._open_channel(channel_id, host, port)
+        except asyncio.CancelledError:
+            await self._close_channel(channel_id)
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error opening channel {channel_id[:8]}...: {e}")
+            await self._close_channel(channel_id)
+
+    def _forget_pending_connect(self, channel_id: str, task: asyncio.Task):
+        if self._pending_connect_tasks.get(channel_id) is task:
+            self._pending_connect_tasks.pop(channel_id)
+
+    async def _cancel_pending_connects(self, channel_id: Optional[str] = None):
+        if channel_id is None:
+            tasks = list(self._pending_connect_tasks.values())
+        else:
+            task = self._pending_connect_tasks.get(channel_id)
+            tasks = [task] if task else []
+
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _handle_control(self, ctrl: dict):
         msg_type = ctrl.get("type")
@@ -162,6 +215,7 @@ class BridgeAgent:
         elif msg_type == "close":
             channel_id = ctrl.get("channel")
             if channel_id:
+                await self._cancel_pending_connects(channel_id)
                 await self._close_channel(channel_id)
 
     async def _handle_data(self, channel_id: str, data: bytes):
