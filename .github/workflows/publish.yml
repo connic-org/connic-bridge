@@ -6,15 +6,53 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'pyproject.toml'
 
 permissions:
   contents: write
   id-token: write
 
 jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Check for a newer project version
+        id: check
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          project_version=$(grep -E '^version = ' pyproject.toml | cut -d '"' -f 2)
+          latest_tag=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)
+
+          if [[ -z "$latest_tag" ]]; then
+            echo "No previous release found; $project_version is publishable."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest_version="${latest_tag#v}"
+          newest_version=$(printf '%s\n%s\n' "$latest_version" "$project_version" | sort -V | tail -n 1)
+          if [[ "$project_version" != "$latest_version" && "$newest_version" == "$project_version" ]]; then
+            echo "$project_version is newer than $latest_version."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$project_version is not newer than $latest_version."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
+    needs: [release-check]
+    if: needs.release-check.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
