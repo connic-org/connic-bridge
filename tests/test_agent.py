@@ -389,7 +389,11 @@ def test_relay_close_request_closes_tcp_channel_and_notifies_relay(monkeypatch):
             forwarder = agent._channel_tasks[CHANNEL_ID]
 
             await agent._handle_control({"type": "close", "channel": CHANNEL_ID})
-            await forwarder
+            forwarder_result = (await asyncio.gather(forwarder, return_exceptions=True))[0]
+            assert forwarder_result is None or isinstance(
+                forwarder_result,
+                asyncio.CancelledError,
+            )
 
             await asyncio.wait_for(service.closed.wait(), timeout=1)
             assert CHANNEL_ID not in agent._channels
