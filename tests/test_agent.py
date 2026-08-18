@@ -1,17 +1,24 @@
 import asyncio
 import json
 import signal
+import ssl
+from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 import websockets.exceptions
 from websockets.asyncio.server import serve
+from websockets.datastructures import Headers
 from websockets.frames import Close
+from websockets.http11 import Response
 
 import connic_bridge.agent as agent_module
 from connic_bridge.agent import BridgeAgent
 
 
 CHANNEL_ID = "12345678-1234-5678-1234-567812345678"
+TLS_CERTIFICATE = Path(__file__).parent / "fixtures" / "localhost-cert.pem"
+TLS_PRIVATE_KEY = Path(__file__).parent / "fixtures" / "localhost-key.pem"
 
 
 class RelaySocket:
@@ -84,9 +91,9 @@ class IdleTcpService:
 
 
 class PendingTcpService:
-    def __init__(self):
-        self.host = "unreachable.internal"
-        self.port = 5432
+    def __init__(self, host="unreachable.internal", port=5432):
+        self.host = host
+        self.port = port
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
 
@@ -158,6 +165,11 @@ class IdleWriter:
 
 def decode_control(message):
     return json.loads(message)
+
+
+def test_bridge_agent_rejects_unencrypted_relay_url():
+    with pytest.raises(ValueError, match="Relay URL must use wss://"):
+        BridgeAgent("ws://relay.example", "cbr_test", {"postgres:5432"})
 
 
 def test_rejects_connect_request_when_target_is_not_allowed():
@@ -366,6 +378,51 @@ def test_stop_closes_active_tcp_channels_and_relay_socket():
     asyncio.run(scenario())
 
 
+def test_stop_during_relay_handshake_closes_connection_without_receiving(monkeypatch):
+    async def scenario():
+        handshake_started = asyncio.Event()
+        finish_handshake = asyncio.Event()
+        receive_started = asyncio.Event()
+
+        class DelayedRelaySocket(RelaySocket):
+            async def __aenter__(self):
+                handshake_started.set()
+                await finish_handshake.wait()
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                await self.close()
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                receive_started.set()
+                await asyncio.Event().wait()
+
+        relay = DelayedRelaySocket()
+        monkeypatch.setattr(
+            agent_module.websockets,
+            "connect",
+            lambda *_args, **_kwargs: relay,
+        )
+        agent = BridgeAgent("wss://relay.example", "cbr_test", set())
+        running = asyncio.create_task(agent.run())
+
+        await asyncio.wait_for(handshake_started.wait(), timeout=1)
+        await asyncio.wait_for(agent.stop(), timeout=1)
+        finish_handshake.set()
+        await asyncio.wait_for(running, timeout=1)
+
+        assert receive_started.is_set() is False
+        assert relay.closed is True
+        assert agent._ws is None
+        assert agent._running is False
+
+    asyncio.run(scenario())
+
+
 def test_relay_close_request_closes_tcp_channel_and_notifies_relay(monkeypatch):
     async def scenario():
         service = IdleTcpService()
@@ -534,6 +591,207 @@ def test_slow_connect_does_not_block_data_and_relay_close_cancels_it(monkeypatch
     asyncio.run(scenario())
 
 
+def test_repeated_connect_replaces_in_flight_attempt_and_close_cancels_replacement(
+    monkeypatch,
+):
+    async def scenario():
+        first = PendingTcpService("postgres-primary.internal", 5432)
+        replacement = PendingTcpService("postgres-replica.internal", 5432)
+        services = {
+            (first.host, first.port): first,
+            (replacement.host, replacement.port): replacement,
+        }
+
+        async def connect(host, port):
+            return await services[(host, port)].connect(host, port)
+
+        relay = RelaySocket()
+        agent = BridgeAgent(
+            "wss://relay.example/tunnel",
+            "cbr_test",
+            {f"{first.host}:{first.port}", f"{replacement.host}:{replacement.port}"},
+        )
+        agent._ws = relay
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", connect)
+
+        await agent._dispatch_control({
+            "type": "connect",
+            "channel": CHANNEL_ID,
+            "host": first.host,
+            "port": first.port,
+        })
+        first_task = agent._pending_connect_tasks[CHANNEL_ID]
+        await asyncio.wait_for(first.started.wait(), timeout=1)
+
+        await agent._dispatch_control({
+            "type": "connect",
+            "channel": CHANNEL_ID,
+            "host": replacement.host,
+            "port": replacement.port,
+        })
+        replacement_task = agent._pending_connect_tasks[CHANNEL_ID]
+        await asyncio.wait_for(replacement.started.wait(), timeout=1)
+
+        assert first.cancelled.is_set()
+        assert first_task.cancelled()
+        assert replacement_task is not first_task
+
+        await agent._dispatch_control({"type": "close", "channel": CHANNEL_ID})
+
+        assert replacement.cancelled.is_set()
+        assert replacement_task.cancelled()
+        assert agent._pending_connect_tasks == {}
+        assert agent._channels == {}
+        assert agent._channel_tasks == {}
+
+    asyncio.run(scenario())
+
+
+def test_stop_during_repeated_connect_does_not_start_replacement_target(monkeypatch):
+    async def scenario():
+        first = PendingTcpService("postgres-primary.internal", 5432)
+        replacement = PendingTcpService("postgres-replica.internal", 5432)
+        services = {
+            (first.host, first.port): first,
+            (replacement.host, replacement.port): replacement,
+        }
+        connect_calls = []
+
+        async def connect(host, port):
+            connect_calls.append((host, port))
+            return await services[(host, port)].connect(host, port)
+
+        relay = RelaySocket()
+        agent = BridgeAgent(
+            "wss://relay.example/tunnel",
+            "cbr_test",
+            {f"{first.host}:{first.port}", f"{replacement.host}:{replacement.port}"},
+        )
+        agent._ws = relay
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", connect)
+
+        await agent._dispatch_control({
+            "type": "connect",
+            "channel": CHANNEL_ID,
+            "host": first.host,
+            "port": first.port,
+        })
+        await asyncio.wait_for(first.started.wait(), timeout=1)
+
+        cancelled_before_replacement = asyncio.Event()
+        resume_replacement = asyncio.Event()
+        cancel_pending_connects = agent._cancel_pending_connects
+
+        async def cancel_then_pause(channel_id=None):
+            await cancel_pending_connects(channel_id)
+            if channel_id == CHANNEL_ID:
+                cancelled_before_replacement.set()
+                await resume_replacement.wait()
+
+        monkeypatch.setattr(agent, "_cancel_pending_connects", cancel_then_pause)
+        repeated_connect = asyncio.create_task(agent._dispatch_control({
+            "type": "connect",
+            "channel": CHANNEL_ID,
+            "host": replacement.host,
+            "port": replacement.port,
+        }))
+        await asyncio.wait_for(cancelled_before_replacement.wait(), timeout=1)
+
+        await asyncio.wait_for(agent.stop(), timeout=1)
+        resume_replacement.set()
+        await asyncio.wait_for(repeated_connect, timeout=1)
+        await asyncio.sleep(0)
+
+        assert first.cancelled.is_set()
+        assert replacement.started.is_set() is False
+        assert connect_calls == [(first.host, first.port)]
+        assert relay.closed is True
+        assert agent._pending_connect_tasks == {}
+
+    asyncio.run(scenario())
+
+
+def test_repeated_connect_for_active_channel_fails_closed_and_allows_safe_reuse(
+    monkeypatch,
+):
+    async def scenario():
+        first = IdleTcpService()
+        first.host = "postgres-primary.internal"
+        replacement = IdleTcpService()
+        replacement.host = "postgres-replica.internal"
+        services = {
+            (first.host, first.port): first,
+            (replacement.host, replacement.port): replacement,
+        }
+        connect_calls = []
+
+        async def connect(host, port):
+            connect_calls.append((host, port))
+            return await services[(host, port)].connect(host, port)
+
+        relay = RelaySocket()
+        agent = BridgeAgent(
+            "wss://relay.example/tunnel",
+            "cbr_test",
+            {f"{first.host}:{first.port}", f"{replacement.host}:{replacement.port}"},
+        )
+        agent._ws = relay
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", connect)
+
+        await agent._dispatch_control({
+            "type": "connect",
+            "channel": CHANNEL_ID,
+            "host": first.host,
+            "port": first.port,
+        })
+        await asyncio.wait_for(first.connected.wait(), timeout=1)
+        await wait_for_control(relay, "connected")
+        first_forwarder = agent._channel_tasks[CHANNEL_ID]
+
+        await agent._dispatch_control({
+            "type": "connect",
+            "channel": CHANNEL_ID,
+            "host": replacement.host,
+            "port": replacement.port,
+        })
+        await wait_for_control(relay, "close")
+
+        assert first.closed.is_set()
+        assert first_forwarder.done()
+        assert connect_calls == [(first.host, first.port)]
+        assert agent._channels == {}
+        assert agent._channel_tasks == {}
+        assert [decode_control(message) for message in relay.sent] == [
+            {"type": "connected", "channel": CHANNEL_ID},
+            {"type": "close", "channel": CHANNEL_ID},
+        ]
+        relay.sent.clear()
+
+        await agent._dispatch_control({
+            "type": "connect",
+            "channel": CHANNEL_ID,
+            "host": replacement.host,
+            "port": replacement.port,
+        })
+        await asyncio.wait_for(replacement.connected.wait(), timeout=1)
+        await wait_for_control(relay, "connected")
+
+        _, replacement_writer = agent._channels[CHANNEL_ID]
+        assert replacement_writer.closed is False
+        assert agent._channel_tasks[CHANNEL_ID].done() is False
+        assert connect_calls == [
+            (first.host, first.port),
+            (replacement.host, replacement.port),
+        ]
+        assert [decode_control(message) for message in relay.sent] == [
+            {"type": "connected", "channel": CHANNEL_ID},
+        ]
+
+        await agent.stop()
+
+    asyncio.run(scenario())
+
+
 def test_stop_cancels_in_flight_target_connect(monkeypatch):
     async def scenario():
         pending_service = PendingTcpService()
@@ -681,7 +939,9 @@ def test_connect_and_serve_preserves_relay_url_query_parameters(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_connect_and_serve_proxies_postgres_ssl_request_over_real_sockets():
+def test_connect_and_serve_without_allowlist_proxies_postgres_ssl_request_over_real_tls_and_tcp_sockets(
+    monkeypatch,
+):
     async def scenario():
         ssl_request = b"\x00\x00\x00\x08\x04\xd2\x16\x2f"
         ssl_response = b"N"
@@ -703,7 +963,6 @@ def test_connect_and_serve_proxies_postgres_ssl_request_over_real_sockets():
 
         tcp_server = await asyncio.start_server(postgres_server, "127.0.0.1", 0)
         tcp_port = tcp_server.sockets[0].getsockname()[1]
-        target = f"127.0.0.1:{tcp_port}"
 
         async def relay_server(connection):
             try:
@@ -735,13 +994,21 @@ def test_connect_and_serve_proxies_postgres_ssl_request_over_real_sockets():
 
         agent = None
         agent_task = None
+        relay_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        relay_tls.load_cert_chain(TLS_CERTIFICATE, TLS_PRIVATE_KEY)
+        monkeypatch.setenv("SSL_CERT_FILE", str(TLS_CERTIFICATE))
         try:
-            async with serve(relay_server, "127.0.0.1", 0) as websocket_server:
+            async with serve(
+                relay_server,
+                "127.0.0.1",
+                0,
+                ssl=relay_tls,
+            ) as websocket_server:
                 relay_port = websocket_server.sockets[0].getsockname()[1]
                 agent = BridgeAgent(
-                    f"ws://127.0.0.1:{relay_port}/bridge?region=eu",
+                    f"wss://127.0.0.1:{relay_port}/bridge?region=eu",
                     "cbr_integration_token",
-                    {target},
+                    set(),
                 )
                 agent_task = asyncio.create_task(agent._connect_and_serve())
 
@@ -758,7 +1025,89 @@ def test_connect_and_serve_proxies_postgres_ssl_request_over_real_sockets():
             assert request == ssl_request
             assert response_frame == CHANNEL_ID.encode("utf-8") + ssl_response
             assert close == {"type": "close", "channel": CHANNEL_ID}
-            assert agent.allowed_hosts == {target}
+            assert agent.allowed_hosts == set()
+            assert agent._channels == {}
+            assert agent._channel_tasks == {}
+            assert agent._ws is None
+        finally:
+            if agent:
+                await agent.stop()
+            if agent_task:
+                await asyncio.gather(agent_task, return_exceptions=True)
+            tcp_server.close()
+            await tcp_server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_connect_and_serve_configured_allowlist_denies_target_over_real_tls_without_opening_tcp_socket(
+    monkeypatch,
+):
+    async def scenario():
+        target_connected = asyncio.Event()
+        relay_done = asyncio.get_running_loop().create_future()
+
+        async def target_server(_reader, writer):
+            target_connected.set()
+            writer.close()
+            await writer.wait_closed()
+
+        tcp_server = await asyncio.start_server(target_server, "127.0.0.1", 0)
+        tcp_port = tcp_server.sockets[0].getsockname()[1]
+
+        async def relay_server(connection):
+            try:
+                path = connection.request.path
+                await connection.send(json.dumps({
+                    "type": "welcome",
+                    "bridge_id": "bridge_allowlist",
+                }))
+                await connection.send(json.dumps({
+                    "type": "connect",
+                    "channel": CHANNEL_ID,
+                    "host": "127.0.0.1",
+                    "port": tcp_port,
+                }))
+                denial = decode_control(await connection.recv())
+                relay_done.set_result((path, denial))
+            except Exception as error:
+                if not relay_done.done():
+                    relay_done.set_exception(error)
+
+        allowed_hosts = {"postgres-primary.internal:5432"}
+        agent = None
+        agent_task = None
+        relay_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        relay_tls.load_cert_chain(TLS_CERTIFICATE, TLS_PRIVATE_KEY)
+        monkeypatch.setenv("SSL_CERT_FILE", str(TLS_CERTIFICATE))
+        try:
+            async with serve(
+                relay_server,
+                "127.0.0.1",
+                0,
+                ssl=relay_tls,
+            ) as websocket_server:
+                relay_port = websocket_server.sockets[0].getsockname()[1]
+                agent = BridgeAgent(
+                    f"wss://127.0.0.1:{relay_port}/bridge",
+                    "cbr_allowlist_token",
+                    allowed_hosts,
+                )
+                agent_task = asyncio.create_task(agent._connect_and_serve())
+
+                path, denial = await asyncio.wait_for(relay_done, timeout=2)
+                await asyncio.wait_for(agent_task, timeout=2)
+
+            assert path == "/bridge?token=cbr_allowlist_token"
+            assert denial == {
+                "type": "error",
+                "channel": CHANNEL_ID,
+                "message": (
+                    f"Host 127.0.0.1:{tcp_port} is not in the allowed hosts list"
+                ),
+            }
+            assert target_connected.is_set() is False
+            assert agent.allowed_hosts == allowed_hosts
             assert agent._channels == {}
             assert agent._channel_tasks == {}
             assert agent._ws is None
@@ -858,26 +1207,26 @@ def test_run_stops_immediately_on_auth_failure_403(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_run_stops_immediately_on_auth_failure_401(monkeypatch):
+def test_run_stops_immediately_on_auth_failure_401(monkeypatch, caplog):
     """When relay returns 401, run() logs auth failure and returns without retrying."""
     async def scenario():
         call_count = 0
 
-        class FakeResponse:
-            status_code = 401
-
         async def fake_connect_and_serve(self):
             nonlocal call_count
             call_count += 1
-            # websockets >=13 uses InvalidStatus with response attribute
-            exc = websockets.exceptions.InvalidStatusCode(401, None)
-            raise exc
+            response = Response(401, "Unauthorized", Headers())
+            raise websockets.exceptions.InvalidStatus(response)
 
+        sleep = MagicMock()
+        monkeypatch.setattr(agent_module.asyncio, "sleep", sleep)
         monkeypatch.setattr(BridgeAgent, "_connect_and_serve", fake_connect_and_serve)
         agent = BridgeAgent("wss://relay.example", "cbr_bad_token", {"postgres:5432"})
         await agent.run()
 
         assert call_count == 1
+        sleep.assert_not_called()
+        assert "Authentication failed: the bridge token was rejected by the relay." in caplog.text
 
     asyncio.run(scenario())
 

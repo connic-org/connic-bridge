@@ -33,7 +33,7 @@ connic-bridge \
 | ------------- | --------------- | ----------------------------------------------------------- |
 | `--token`     | `BRIDGE_TOKEN`  | Bridge authentication token (from Connic dashboard)         |
 | `--relay-url` | `RELAY_URL`     | Relay URL (default: `wss://relay.connic.co`)                |
-| `--allow`     | `ALLOWED_HOSTS` | Comma-separated `host:port` pairs the bridge may connect to |
+| `--allow`     | `ALLOWED_HOSTS` | Optional `host:port` allowlist; if omitted, all network-reachable hosts are allowed |
 | `--log-level` | `LOG_LEVEL`     | `DEBUG`, `INFO`, `WARNING`, or `ERROR`                      |
 
 
@@ -43,8 +43,8 @@ connic-bridge \
   Connic relay service. No inbound ports need to be opened.
 2. When a Connic connector (e.g. Kafka, PostgreSQL) needs to reach a private
   endpoint, the relay asks the bridge to open a TCP connection.
-3. The bridge validates the target against the allowed hosts list, opens a
-  local TCP connection, and proxies data bidirectionally.
+3. If an allowed hosts list is configured, the bridge validates the target
+  against it, then opens a local TCP connection and proxies data bidirectionally.
 4. All traffic is encrypted via WSS (TLS).
 
 ## Connect Services That Discover Endpoints
@@ -53,8 +53,10 @@ Some clients receive a different hostname or IP address after their first
 connection. Automatic destination routes send those follow-up connections
 through the correct bridge without requiring changes to your client code.
 
-Configure routes under **Project Settings → Bridge**, and add every permitted
-`host:port` to `ALLOWED_HOSTS`.
+Configure routes under **Project Settings → Bridge**. To restrict what the
+bridge can reach, add every permitted `host:port` to `ALLOWED_HOSTS`. When the
+variable is unset or empty, every host reachable from the bridge's network is
+allowed.
 
 See [the automatic destination routes guide](https://connic.co/docs/v1/platform/bridge#use-tools-middlewares)
 for setup instructions, API usage, supported patterns, and limits.
@@ -62,6 +64,7 @@ for setup instructions, API usage, supported patterns, and limits.
 ## Security
 
 - **Outbound-only** - the bridge never accepts inbound connections.
-- **Allowed hosts** - you control exactly which services the bridge can reach.
+- **Optional allowed hosts** - set an exact `host:port` allowlist to restrict
+  access. Without one, the bridge can reach any host available from its network.
 - **Token authentication** - each bridge is tied to a single Connic project.
 - **TLS encryption** - all relay communication uses WSS.

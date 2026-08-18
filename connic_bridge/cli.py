@@ -8,7 +8,7 @@ Usage:
 Environment variables:
     BRIDGE_TOKEN     - Bridge authentication token
     RELAY_URL        - Relay WebSocket URL (default: wss://relay.connic.co)
-    ALLOWED_HOSTS    - Comma-separated list of host:port pairs
+    ALLOWED_HOSTS    - Optional comma-separated host:port allowlist
 """
 import argparse
 import asyncio
@@ -16,7 +16,7 @@ import logging
 import os
 import sys
 
-from connic_bridge.agent import run_agent
+from connic_bridge.agent import run_agent, validate_relay_url
 
 DEFAULT_RELAY_URL = "wss://relay.connic.co"
 
@@ -39,7 +39,10 @@ def main():
         "--allow",
         action="append",
         default=[],
-        help="Allowed host:port (can be specified multiple times). Also accepts comma-separated values.",
+        help=(
+            "Allowed host:port restriction (can be specified multiple times). "
+            "Also accepts comma-separated values. If omitted, all network-reachable hosts are allowed."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -62,6 +65,12 @@ def main():
         print("Error: Bridge token is required. Use --token or set BRIDGE_TOKEN env var.")
         sys.exit(1)
 
+    try:
+        validate_relay_url(args.relay_url)
+    except ValueError as error:
+        print(f"Error: {error}")
+        sys.exit(1)
+
     # Resolve allowed hosts (from --allow args and ALLOWED_HOSTS env)
     allowed_hosts = set()
     env_hosts = os.environ.get("ALLOWED_HOSTS", "")
@@ -77,13 +86,13 @@ def main():
                 allowed_hosts.add(h)
 
     if not allowed_hosts:
-        print("Warning: No allowed hosts specified. The bridge will reject all connections.")
-        print("Use --allow host:port or set ALLOWED_HOSTS env var.")
+        print("Warning: No allowed hosts specified. The bridge can reach any host available from this network.")
+        print("Use --allow host:port or set ALLOWED_HOSTS to restrict access.")
 
     # Run
     print("Connic Bridge starting...")
     print(f"  Relay:         {args.relay_url}")
-    print(f"  Allowed hosts: {', '.join(sorted(allowed_hosts)) or '(none)'}")
+    print(f"  Allowed hosts: {', '.join(sorted(allowed_hosts)) or '(unrestricted)'}")
 
     asyncio.run(run_agent(args.relay_url, token, allowed_hosts))
 

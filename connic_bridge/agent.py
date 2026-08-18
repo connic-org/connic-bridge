@@ -18,6 +18,11 @@ from websockets.asyncio.client import ClientConnection
 logger = logging.getLogger("connic-bridge")
 
 
+def validate_relay_url(relay_url: str) -> None:
+    if urlsplit(relay_url).scheme != "wss":
+        raise ValueError("Relay URL must use wss:// to protect bridge traffic.")
+
+
 class BridgeAgent:
     """
     Bridge agent that connects to the relay and proxies tunnel requests.
@@ -35,6 +40,7 @@ class BridgeAgent:
         token: str,
         allowed_hosts: Set[str],
     ):
+        validate_relay_url(relay_url)
         self.relay_url = relay_url
         self.token = token
         self.allowed_hosts = allowed_hosts
@@ -122,9 +128,10 @@ class BridgeAgent:
 
         async with websockets.connect(url, ping_interval=30, ping_timeout=10) as ws:
             self._ws = ws
-            logger.info("Connected to relay")
-
             try:
+                if self._stopping:
+                    return
+                logger.info("Connected to relay")
                 async for message in ws:
                     if isinstance(message, str):
                         # Control message (JSON)
@@ -160,6 +167,8 @@ class BridgeAgent:
 
         channel_id = ctrl["channel"]
         await self._cancel_pending_connects(channel_id)
+        if self._stopping:
+            return
         task = asyncio.create_task(
             self._open_channel_in_background(channel_id, ctrl["host"], ctrl["port"])
         )
@@ -204,7 +213,9 @@ class BridgeAgent:
         if msg_type == "welcome":
             bridge_id = ctrl.get("bridge_id", "unknown")
             logger.info(f"Bridge authenticated (bridge_id={bridge_id})")
-            logger.info(f"Allowed hosts: {', '.join(sorted(self.allowed_hosts))}")
+            logger.info(
+                f"Allowed hosts: {', '.join(sorted(self.allowed_hosts)) or '(unrestricted)'}"
+            )
 
         elif msg_type == "connect":
             channel_id = ctrl["channel"]
@@ -234,8 +245,13 @@ class BridgeAgent:
         """Open a TCP connection to the target and start proxying."""
         target = f"{host}:{port}"
 
-        # Validate against allowed hosts
-        if target not in self.allowed_hosts:
+        if channel_id in self._channels or channel_id in self._channel_tasks:
+            logger.warning(f"Rejecting duplicate active channel {channel_id[:8]}...")
+            await self._close_channel(channel_id)
+            return
+
+        # Validate against allowed hosts when an allowlist is configured
+        if self.allowed_hosts and target not in self.allowed_hosts:
             logger.warning(f"Blocked connection to {target} (not in allowed hosts)")
             await self._send_control({
                 "type": "error",
@@ -307,6 +323,7 @@ class BridgeAgent:
 
         if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
         # Notify relay
         try:
