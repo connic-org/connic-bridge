@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import signal
 import ssl
 from pathlib import Path
@@ -172,30 +173,6 @@ def test_bridge_agent_rejects_unencrypted_relay_url():
         BridgeAgent("ws://relay.example", "cbr_test", {"postgres:5432"})
 
 
-def test_rejects_connect_request_when_target_is_not_allowed():
-    async def scenario():
-        relay = RelaySocket()
-        agent = BridgeAgent("wss://relay.example", "cbr_test", {"postgres:5432"})
-        agent._ws = relay
-
-        await agent._handle_control({
-            "type": "connect",
-            "channel": CHANNEL_ID,
-            "host": "kafka",
-            "port": 9092,
-        })
-
-        assert agent._channels == {}
-        assert len(relay.sent) == 1
-        assert decode_control(relay.sent[0]) == {
-            "type": "error",
-            "channel": CHANNEL_ID,
-            "message": "Host kafka:9092 is not in the allowed hosts list",
-        }
-
-    asyncio.run(scenario())
-
-
 def test_open_channel_proxies_data_between_relay_and_allowed_tcp_target(monkeypatch):
     async def scenario():
         service = RecordingTcpService()
@@ -311,7 +288,7 @@ def test_allowed_target_connection_timeout_is_reported_to_relay(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_relay_data_to_failed_tcp_writer_closes_channel_and_notifies_relay():
+def test_relay_data_to_failed_tcp_writer_closes_channel_and_notifies_relay(monkeypatch):
     async def scenario():
         class FailingWriter:
             def __init__(self):
@@ -334,15 +311,202 @@ def test_relay_data_to_failed_tcp_writer_closes_channel_and_notifies_relay():
         writer = FailingWriter()
         agent = BridgeAgent("wss://relay.example", "cbr_test", {"kafka.internal:9092"})
         agent._ws = relay
-        agent._channels[CHANNEL_ID] = (object(), writer)
+
+        async def connect(_host, _port):
+            return QueueReader(), writer
+
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", connect)
+        await agent._handle_control({"type": "connect", "channel": CHANNEL_ID, "host": "kafka.internal", "port": 9092})
 
         await agent._handle_data("missing-channel", b"ignored")
         await agent._handle_data(CHANNEL_ID, b"hello")
+        await wait_for_control(relay, "close")
 
         assert writer.writes == [b"hello"]
         assert writer.closed is True
         assert CHANNEL_ID not in agent._channels
         assert decode_control(relay.sent[-1]) == {"type": "close", "channel": CHANNEL_ID}
+
+    asyncio.run(scenario())
+
+
+def test_stalled_tcp_target_does_not_block_other_channels_or_disconnect(monkeypatch):
+    async def scenario():
+        healthy_channel = "22222222-2222-2222-2222-222222222222"
+        healthy_received = asyncio.Event()
+        release_stalled_target = asyncio.Event()
+        writers = {}
+
+        class TargetWriter:
+            def __init__(self, stalled):
+                self.stalled = stalled
+                self.received = bytearray()
+                self.closed = False
+                self.transport = MagicMock()
+
+            def write(self, data):
+                self.received.extend(data)
+
+            async def drain(self):
+                if self.stalled:
+                    await release_stalled_target.wait()
+                elif self.received == b"hello world":
+                    healthy_received.set()
+
+            def close(self):
+                self.closed = True
+
+            async def wait_closed(self):
+                if self.stalled:
+                    await release_stalled_target.wait()
+
+        async def connect(host, _port):
+            writer = TargetWriter(host == "stalled.internal")
+            writers[host] = writer
+            return QueueReader(), writer
+
+        class RelayWithTargets(ScriptedRelaySocket):
+            async def __anext__(self):
+                if not self._messages:
+                    await healthy_received.wait()
+                    while not any(
+                        isinstance(message, str)
+                        and decode_control(message) == {"type": "close", "channel": CHANNEL_ID}
+                        for message in self.sent
+                    ):
+                        await asyncio.sleep(0)
+                message = await super().__anext__()
+                if isinstance(message, bytes):
+                    channel = message[:36].decode()
+                    while not any(
+                        isinstance(sent, str)
+                        and decode_control(sent) == {"type": "connected", "channel": channel}
+                        for sent in self.sent
+                    ):
+                        await asyncio.sleep(0)
+                return message
+
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", connect)
+        monkeypatch.setattr(agent_module, "TCP_WRITE_TIMEOUT", 0.01)
+        monkeypatch.setattr(agent_module, "TCP_CLOSE_TIMEOUT", 0.01)
+        relay = RelayWithTargets([
+            json.dumps({"type": "connect", "channel": CHANNEL_ID, "host": "stalled.internal", "port": 5432}),
+            json.dumps({"type": "connect", "channel": healthy_channel, "host": "healthy.internal", "port": 5432}),
+            CHANNEL_ID.encode() + b"blocked",
+            healthy_channel.encode() + b"hello",
+            healthy_channel.encode() + b" world",
+        ])
+        monkeypatch.setattr(agent_module, "RelayConnect", lambda *_args, **_kwargs: relay)
+        agent = BridgeAgent("wss://relay.example", "cbr_test", set())
+
+        serving = asyncio.create_task(agent._connect_and_serve())
+        try:
+            done, _ = await asyncio.wait({serving}, timeout=1)
+            assert serving in done, "Stalled target blocked relay processing or cleanup"
+            await serving
+        finally:
+            release_stalled_target.set()
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)
+
+        assert writers["healthy.internal"].received == b"hello world"
+        assert all(writer.closed for writer in writers.values())
+        writers["stalled.internal"].transport.abort.assert_called_once()
+        assert agent._channels == {}
+        assert agent._channel_tasks == {}
+        assert agent._channel_write_queues == {}
+        assert agent._channel_write_tasks == {}
+        assert agent._channel_workers == set()
+        assert agent._ws is None
+
+    asyncio.run(scenario())
+
+
+def test_relay_write_queue_overflow_closes_only_the_full_channel(monkeypatch):
+    async def scenario():
+        service = IdleTcpService()
+        healthy_service = IdleTcpService()
+        healthy_service.host = "healthy.internal"
+        healthy_channel = "22222222-2222-2222-2222-222222222222"
+        drain_started = asyncio.Event()
+
+        class StalledWriter(IdleWriter):
+            async def drain(self):
+                drain_started.set()
+                await asyncio.Event().wait()
+
+        async def connect(host, port):
+            target = service if host == service.host else healthy_service
+            reader, writer = await target.connect(host, port)
+            if target is service:
+                writer = StalledWriter(service)
+            return reader, writer
+
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", connect)
+        relay = RelaySocket()
+        agent = BridgeAgent("wss://relay.example", "cbr_test", set())
+        agent._ws = relay
+        try:
+            for channel, target in ((CHANNEL_ID, service), (healthy_channel, healthy_service)):
+                await agent._handle_control({"type": "connect", "channel": channel, "host": target.host, "port": target.port})
+
+            await agent._handle_data(CHANNEL_ID, b"start stalled write")
+            await asyncio.wait_for(drain_started.wait(), timeout=1)
+            for _ in range(256):
+                await agent._handle_data(CHANNEL_ID, b"queued payload")
+
+            assert service.closed.is_set()
+            assert CHANNEL_ID not in agent._channels
+            assert healthy_channel in agent._channels
+            assert not healthy_service.closed.is_set()
+            assert [decode_control(message) for message in relay.sent if decode_control(message)["type"] == "close"] == [
+                {"type": "close", "channel": CHANNEL_ID},
+            ]
+        finally:
+            await agent.stop()
+            await service.close()
+            await healthy_service.close()
+
+    asyncio.run(scenario())
+
+
+def test_buffered_relay_burst_and_stop_preserve_all_tcp_bytes(monkeypatch):
+    async def scenario():
+        service = IdleTcpService()
+
+        class FastWriter(IdleWriter):
+            def __init__(self):
+                super().__init__(service)
+                self.received = bytearray()
+
+            def write(self, data):
+                self.received.extend(data)
+
+        writer = FastWriter()
+
+        async def connect(host, port):
+            reader, _ = await service.connect(host, port)
+            return reader, writer
+
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", connect)
+        agent = BridgeAgent("wss://relay.example", "cbr_test", set())
+        agent._ws = RelaySocket()
+        await agent._handle_control({"type": "connect", "channel": CHANNEL_ID, "host": service.host, "port": service.port})
+        for value in range(256):
+            await agent._handle_data(CHANNEL_ID, bytes([value]))
+
+        assert CHANNEL_ID in agent._channels
+        stopping = asyncio.create_task(agent.stop())
+        try:
+            done, _ = await asyncio.wait({stopping}, timeout=1)
+            assert stopping in done, "TCP drain cancellation blocked shutdown"
+            await stopping
+            assert writer.received == bytes(range(256))
+            assert writer.closed
+            assert agent._channel_workers == set()
+        finally:
+            stopping.cancel()
+            await asyncio.gather(stopping, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -403,8 +567,8 @@ def test_stop_during_relay_handshake_closes_connection_without_receiving(monkeyp
 
         relay = DelayedRelaySocket()
         monkeypatch.setattr(
-            agent_module.websockets,
-            "connect",
+            agent_module,
+            "RelayConnect",
             lambda *_args, **_kwargs: relay,
         )
         agent = BridgeAgent("wss://relay.example", "cbr_test", set())
@@ -466,10 +630,50 @@ def test_relay_close_request_closes_tcp_channel_and_notifies_relay(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_relay_close_without_channel_leaves_active_tcp_channel_open(monkeypatch):
+    async def scenario():
+        service = IdleTcpService()
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", service.connect)
+        try:
+            relay = RelaySocket()
+            agent = BridgeAgent(
+                "wss://relay.example",
+                "cbr_test",
+                {f"{service.host}:{service.port}"},
+            )
+            agent._ws = relay
+
+            await agent._handle_control({
+                "type": "connect",
+                "channel": CHANNEL_ID,
+                "host": service.host,
+                "port": service.port,
+            })
+            await asyncio.wait_for(service.connected.wait(), timeout=1)
+            forwarder = agent._channel_tasks[CHANNEL_ID]
+
+            await agent._dispatch_control({"type": "close"})
+
+            assert CHANNEL_ID in agent._channels
+            assert agent._channel_tasks[CHANNEL_ID] is forwarder
+            assert forwarder.done() is False
+            assert service.closed.is_set() is False
+            assert [decode_control(message) for message in relay.sent] == [
+                {"type": "connected", "channel": CHANNEL_ID},
+            ]
+        finally:
+            await agent.stop()
+            await service.close()
+
+    asyncio.run(scenario())
+
+
 def test_connect_and_serve_processes_relay_control_and_data_frames(monkeypatch):
     async def scenario():
         class RelayFollowingConnectHandshake(ScriptedRelaySocket):
             async def __anext__(self):
+                if not self._messages:
+                    await wait_for_binary_frame(self)
                 message = await super().__anext__()
                 if isinstance(message, bytes) and len(message) >= 36:
                     await wait_for_control(self, "connected")
@@ -492,13 +696,7 @@ def test_connect_and_serve_processes_relay_control_and_data_frames(monkeypatch):
                 }),
                 CHANNEL_ID.encode("utf-8") + b"hello",
             ])
-            connect_calls = []
-
-            def fake_connect(url, **kwargs):
-                connect_calls.append((url, kwargs))
-                return relay
-
-            monkeypatch.setattr(agent_module.websockets, "connect", fake_connect)
+            monkeypatch.setattr(agent_module, "RelayConnect", lambda *_args, **_kwargs: relay)
             agent = BridgeAgent(
                 "wss://relay.example/tunnel",
                 "cbr_test",
@@ -507,12 +705,6 @@ def test_connect_and_serve_processes_relay_control_and_data_frames(monkeypatch):
 
             await agent._connect_and_serve()
 
-            assert connect_calls == [
-                (
-                    "wss://relay.example/tunnel?token=cbr_test",
-                    {"ping_interval": 30, "ping_timeout": 10},
-                )
-            ]
             assert decode_control(relay.sent[0]) == {"type": "connected", "channel": CHANNEL_ID}
             assert await asyncio.wait_for(service.received.get(), timeout=1) == b"hello"
             assert await wait_for_binary_frame(relay) == CHANNEL_ID.encode("utf-8") + b"pong"
@@ -566,19 +758,26 @@ def test_slow_connect_does_not_block_data_and_relay_close_cancels_it(monkeypatch
         agent = BridgeAgent(
             "wss://relay.example/tunnel",
             "cbr_test",
-            {f"{pending_service.host}:{pending_service.port}"},
+            {f"{pending_service.host}:{pending_service.port}", "existing.internal:5432"},
         )
-        agent._channels[existing_channel_id] = (object(), writer)
+
+        async def connect(host, port):
+            if host == "existing.internal":
+                return QueueReader(), writer
+            return await pending_service.connect(host, port)
+
         monkeypatch.setattr(
             agent_module.asyncio,
             "open_connection",
-            pending_service.connect,
+            connect,
         )
         monkeypatch.setattr(
-            agent_module.websockets,
-            "connect",
+            agent_module,
+            "RelayConnect",
             lambda *_args, **_kwargs: relay,
         )
+        agent._ws = relay
+        await agent._handle_control({"type": "connect", "channel": existing_channel_id, "host": "existing.internal", "port": 5432})
 
         await asyncio.wait_for(agent._connect_and_serve(), timeout=1)
 
@@ -911,37 +1110,11 @@ def test_relay_close_during_connect_ack_closes_local_target(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_connect_and_serve_preserves_relay_url_query_parameters(monkeypatch):
-    async def scenario():
-        relay = ScriptedRelaySocket([])
-        connect_calls = []
-
-        def fake_connect(url, **kwargs):
-            connect_calls.append((url, kwargs))
-            return relay
-
-        monkeypatch.setattr(agent_module.websockets, "connect", fake_connect)
-        agent = BridgeAgent(
-            "wss://relay.example/tunnel?region=eu",
-            "cbr_test",
-            {"postgres:5432"},
-        )
-
-        await agent._connect_and_serve()
-
-        assert connect_calls == [
-            (
-                "wss://relay.example/tunnel?region=eu&token=cbr_test",
-                {"ping_interval": 30, "ping_timeout": 10},
-            )
-        ]
-
-    asyncio.run(scenario())
-
-
+@pytest.mark.parametrize("userinfo", ["", "user:password@"])
 def test_connect_and_serve_without_allowlist_proxies_postgres_ssl_request_over_real_tls_and_tcp_sockets(
-    monkeypatch,
+    monkeypatch, caplog, userinfo,
 ):
+    caplog.set_level(logging.DEBUG)
     async def scenario():
         ssl_request = b"\x00\x00\x00\x08\x04\xd2\x16\x2f"
         ssl_response = b"N"
@@ -967,6 +1140,7 @@ def test_connect_and_serve_without_allowlist_proxies_postgres_ssl_request_over_r
         async def relay_server(connection):
             try:
                 path = connection.request.path
+                authorization = connection.request.headers.get_all("Authorization")
                 await connection.send(json.dumps({
                     "type": "welcome",
                     "bridge_id": "bridge_integration",
@@ -987,7 +1161,7 @@ def test_connect_and_serve_without_allowlist_proxies_postgres_ssl_request_over_r
                     "channel": CHANNEL_ID,
                 }))
                 close = decode_control(await connection.recv())
-                relay_done.set_result((path, connected, response_frame, close))
+                relay_done.set_result((path, authorization, connected, response_frame, close))
             except Exception as error:
                 if not relay_done.done():
                     relay_done.set_exception(error)
@@ -1006,13 +1180,13 @@ def test_connect_and_serve_without_allowlist_proxies_postgres_ssl_request_over_r
             ) as websocket_server:
                 relay_port = websocket_server.sockets[0].getsockname()[1]
                 agent = BridgeAgent(
-                    f"wss://127.0.0.1:{relay_port}/bridge?region=eu",
+                    f"wss://{userinfo}127.0.0.1:{relay_port}/bridge?region=eu&%74oken=cbr_stale&token=cbr_other",
                     "cbr_integration_token",
                     set(),
                 )
                 agent_task = asyncio.create_task(agent._connect_and_serve())
 
-                path, connected, response_frame, close = await asyncio.wait_for(
+                path, authorization, connected, response_frame, close = await asyncio.wait_for(
                     relay_done,
                     timeout=2,
                 )
@@ -1020,7 +1194,18 @@ def test_connect_and_serve_without_allowlist_proxies_postgres_ssl_request_over_r
 
             request = await asyncio.wait_for(tcp_request, timeout=2)
             await asyncio.wait_for(tcp_closed.wait(), timeout=2)
-            assert path == "/bridge?region=eu&token=cbr_integration_token"
+            assert path == "/bridge?region=eu"
+            assert authorization == (
+                ["Basic dXNlcjpwYXNzd29yZA==", "Bearer cbr_integration_token"]
+                if userinfo else ["Bearer cbr_integration_token"]
+            )
+            client_logs = "\n".join(
+                record.getMessage() for record in caplog.records
+                if record.name in {"connic-bridge", "connic-bridge.websocket", "websockets.client"}
+            )
+            assert all(token not in client_logs for token in ("cbr_integration_token", "cbr_stale", "cbr_other"))
+            assert "BINARY" not in client_logs
+            assert "dXNlcjpwYXNzd29yZA==" not in client_logs
             assert connected == {"type": "connected", "channel": CHANNEL_ID}
             assert request == ssl_request
             assert response_frame == CHANNEL_ID.encode("utf-8") + ssl_response
@@ -1058,6 +1243,7 @@ def test_connect_and_serve_configured_allowlist_denies_target_over_real_tls_with
         async def relay_server(connection):
             try:
                 path = connection.request.path
+                authorization = connection.request.headers.get("Authorization")
                 await connection.send(json.dumps({
                     "type": "welcome",
                     "bridge_id": "bridge_allowlist",
@@ -1069,7 +1255,7 @@ def test_connect_and_serve_configured_allowlist_denies_target_over_real_tls_with
                     "port": tcp_port,
                 }))
                 denial = decode_control(await connection.recv())
-                relay_done.set_result((path, denial))
+                relay_done.set_result((path, authorization, denial))
             except Exception as error:
                 if not relay_done.done():
                     relay_done.set_exception(error)
@@ -1095,10 +1281,11 @@ def test_connect_and_serve_configured_allowlist_denies_target_over_real_tls_with
                 )
                 agent_task = asyncio.create_task(agent._connect_and_serve())
 
-                path, denial = await asyncio.wait_for(relay_done, timeout=2)
+                path, authorization, denial = await asyncio.wait_for(relay_done, timeout=2)
                 await asyncio.wait_for(agent_task, timeout=2)
 
-            assert path == "/bridge?token=cbr_allowlist_token"
+            assert path == "/bridge"
+            assert authorization == "Bearer cbr_allowlist_token"
             assert denial == {
                 "type": "error",
                 "channel": CHANNEL_ID,
@@ -1122,6 +1309,39 @@ def test_connect_and_serve_configured_allowlist_denies_target_over_real_tls_with
     asyncio.run(scenario())
 
 
+def test_relay_redirect_cannot_forward_bridge_token_to_another_origin(monkeypatch):
+    async def scenario():
+        redirected_requests = []
+
+        async def redirected_relay(connection):
+            redirected_requests.append(connection.request)
+
+        async def finish_redirect(connection):
+            await connection.wait_closed()
+
+        relay_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        relay_tls.load_cert_chain(TLS_CERTIFICATE, TLS_PRIVATE_KEY)
+        monkeypatch.setenv("SSL_CERT_FILE", str(TLS_CERTIFICATE))
+        async with serve(redirected_relay, "127.0.0.1", 0, ssl=relay_tls) as target:
+            target_port = target.sockets[0].getsockname()[1]
+
+            def redirect(_connection, _request):
+                return Response(307, "Temporary Redirect", Headers({
+                    "Location": f"wss://127.0.0.1:{target_port}/",
+                }), b"")
+
+            async with serve(finish_redirect, "127.0.0.1", 0, ssl=relay_tls, process_request=redirect) as source:
+                source_port = source.sockets[0].getsockname()[1]
+                agent = BridgeAgent(f"wss://127.0.0.1:{source_port}/", "cbr_redirect_secret", set())
+                with pytest.raises((websockets.exceptions.InvalidStatus, ConnectionError)):
+                    await agent._connect_and_serve()
+
+        assert redirected_requests == []
+        assert agent._ws is None
+
+    asyncio.run(scenario())
+
+
 def test_connect_and_serve_closes_idle_tcp_channel_when_relay_disconnects(monkeypatch):
     async def scenario():
         service = IdleTcpService()
@@ -1136,7 +1356,7 @@ def test_connect_and_serve_closes_idle_tcp_channel_when_relay_disconnects(monkey
                     "port": service.port,
                 }),
             ])
-            monkeypatch.setattr(agent_module.websockets, "connect", lambda *_args, **_kwargs: relay)
+            monkeypatch.setattr(agent_module, "RelayConnect", lambda *_args, **_kwargs: relay)
             agent = BridgeAgent(
                 "wss://relay.example/tunnel",
                 "cbr_test",
@@ -1525,35 +1745,6 @@ def test_forward_tcp_to_relay_handles_connection_error():
     asyncio.run(scenario())
 
 
-def test_forward_tcp_to_relay_handles_eof():
-    """When reader returns empty bytes (EOF), forwarding stops and channel is closed."""
-    async def scenario():
-        relay = RelaySocket()
-        agent = BridgeAgent("wss://relay.example", "cbr_test", {"postgres:5432"})
-        agent._ws = relay
-
-        class EofReader:
-            async def read(self, n):
-                return b""  # EOF
-
-        class DummyWriter:
-            def __init__(self):
-                self.closed = False
-            def close(self):
-                self.closed = True
-            async def wait_closed(self):
-                pass
-
-        writer = DummyWriter()
-        agent._channels[CHANNEL_ID] = (EofReader(), writer)
-
-        await agent._forward_tcp_to_relay(CHANNEL_ID, EofReader())
-
-        assert CHANNEL_ID not in agent._channels
-
-    asyncio.run(scenario())
-
-
 def test_forward_tcp_to_relay_drops_late_data_after_relay_disconnect():
     async def scenario():
         service = IdleTcpService()
@@ -1660,75 +1851,44 @@ def test_close_channel_handles_send_control_failure():
 # ---------------------------------------------------------------------------
 
 
-def test_run_agent_function(monkeypatch):
-    """run_agent sets up signal handlers and runs the agent."""
+@pytest.mark.parametrize("shutdown_signal", [signal.SIGTERM, signal.SIGINT])
+def test_run_agent_shutdown_callback_schedules_stop(monkeypatch, shutdown_signal):
     async def scenario():
-        call_count = 0
+        handlers = {}
+        relay_closed = asyncio.Event()
+        started = []
 
-        async def fake_connect_and_serve(self):
-            nonlocal call_count
-            call_count += 1
-            self._running = False
+        class ClosingRelaySocket(RelaySocket):
+            async def close(self):
+                await super().close()
+                relay_closed.set()
 
-        monkeypatch.setattr(BridgeAgent, "_connect_and_serve", fake_connect_and_serve)
+        def add_handler(sig, callback):
+            handlers[sig] = callback
 
-        from connic_bridge.agent import run_agent
-        await run_agent("wss://relay.example", "cbr_test", {"postgres:5432"})
+        mock_loop = MagicMock()
+        mock_loop.add_signal_handler = add_handler
+        monkeypatch.setattr(asyncio, "get_event_loop", lambda: mock_loop)
+        relay = ClosingRelaySocket()
 
-        assert call_count == 1
+        async def serve_until_shutdown(self):
+            assert set(handlers) == {signal.SIGTERM, signal.SIGINT}
+            started.append((self.relay_url, self.token, self.allowed_hosts))
+            self._ws = relay
+            handlers[shutdown_signal]()
+            await asyncio.wait_for(relay_closed.wait(), timeout=1)
+
+        monkeypatch.setattr(BridgeAgent, "_connect_and_serve", serve_until_shutdown)
+
+        await asyncio.wait_for(
+            agent_module.run_agent("wss://relay.example", "cbr_test", {"postgres:5432"}),
+            timeout=1,
+        )
+
+        assert started == [("wss://relay.example", "cbr_test", {"postgres:5432"})]
+        assert relay.closed is True
 
     asyncio.run(scenario())
-
-
-def test_run_agent_registers_sigterm_and_sigint_handlers(monkeypatch):
-    """Unix-style loop registers SIGTERM and SIGINT before running the agent."""
-    registered = []
-
-    def capture(sig, _callback):
-        registered.append(sig)
-
-    mock_loop = MagicMock()
-    mock_loop.add_signal_handler = capture
-    monkeypatch.setattr(asyncio, "get_event_loop", lambda: mock_loop)
-
-    async def instant_run(self):
-        self._running = False
-
-    monkeypatch.setattr(BridgeAgent, "run", instant_run)
-
-    asyncio.run(agent_module.run_agent("wss://relay.example", "cbr_test", {"postgres:5432"}))
-
-    assert registered == [signal.SIGTERM, signal.SIGINT]
-
-
-def test_run_agent_shutdown_callback_schedules_stop(monkeypatch):
-    """When the OS signal handler fires, stop() runs on the loop (graceful shutdown path)."""
-    handlers = {}
-
-    def add_handler(sig, callback):
-        handlers[sig] = callback
-
-    mock_loop = MagicMock()
-    mock_loop.add_signal_handler = add_handler
-    monkeypatch.setattr(asyncio, "get_event_loop", lambda: mock_loop)
-
-    stop_events = []
-
-    async def fake_stop(self):
-        stop_events.append("stop")
-        self._running = False
-
-    async def fake_run(self):
-        handlers[signal.SIGTERM]()
-        await asyncio.sleep(0)
-        self._running = False
-
-    monkeypatch.setattr(BridgeAgent, "run", fake_run)
-    monkeypatch.setattr(BridgeAgent, "stop", fake_stop)
-
-    asyncio.run(agent_module.run_agent("wss://relay.example", "cbr_test", {"postgres:5432"}))
-
-    assert stop_events == ["stop"]
 
 
 def test_run_agent_tolerates_platform_without_signal_handlers(monkeypatch):
@@ -1738,11 +1898,14 @@ def test_run_agent_tolerates_platform_without_signal_handlers(monkeypatch):
 
     monkeypatch.setattr(asyncio, "get_event_loop", lambda: mock_loop)
 
+    started = []
+
     async def instant_run(self):
-        self._running = False
+        started.append((self.relay_url, self.token, self.allowed_hosts))
 
     monkeypatch.setattr(BridgeAgent, "run", instant_run)
 
     asyncio.run(agent_module.run_agent("wss://relay.example", "cbr_test", {"postgres:5432"}))
 
     assert mock_loop.add_signal_handler.call_count == 2
+    assert started == [("wss://relay.example", "cbr_test", {"postgres:5432"})]

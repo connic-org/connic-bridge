@@ -10,12 +10,30 @@ import json
 import logging
 import signal
 from typing import Dict, Optional, Set
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import websockets
-from websockets.asyncio.client import ClientConnection
+from websockets.asyncio.client import ClientConnection, connect
 
 logger = logging.getLogger("connic-bridge")
+transport_logger = logging.getLogger("connic-bridge.websocket")
+transport_logger.setLevel(logging.WARNING)
+
+TCP_WRITE_QUEUE_MAXSIZE = 16
+TCP_WRITE_TIMEOUT = 10.0
+TCP_CLOSE_TIMEOUT = 5.0
+
+
+class RelayConnect(connect):
+    def process_redirect(self, exc):
+        target = super().process_redirect(exc)
+        if isinstance(target, str):
+            current_url, target_url = urlsplit(self.uri), urlsplit(target)
+            if (current_url.hostname, current_url.port or 443) != (
+                target_url.hostname, target_url.port or 443
+            ):
+                return exc
+        return target
 
 
 def validate_relay_url(relay_url: str) -> None:
@@ -47,6 +65,9 @@ class BridgeAgent:
         self._ws: Optional[ClientConnection] = None
         self._channels: Dict[str, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
         self._channel_tasks: Dict[str, asyncio.Task] = {}
+        self._channel_write_queues: Dict[str, asyncio.Queue] = {}
+        self._channel_write_tasks: Dict[str, asyncio.Task] = {}
+        self._channel_workers: Set[asyncio.Task] = set()
         self._pending_connect_tasks: Dict[str, asyncio.Task] = {}
         self._reconnect_task: Optional[asyncio.Task] = None
         self._running = False
@@ -111,9 +132,12 @@ class BridgeAgent:
         if self._reconnect_task:
             self._reconnect_task.cancel()
         await self._cancel_pending_connects()
+        tasks = list(self._channel_workers)
         # Close all channels
         for channel_id in list(self._channels.keys()):
             await self._close_channel(channel_id)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         # Close WebSocket
         if self._ws:
             await self._ws.close()
@@ -121,12 +145,20 @@ class BridgeAgent:
     async def _connect_and_serve(self):
         """Connect to relay and process messages."""
         relay_url = urlsplit(self.relay_url)
-        token_query = urlencode({"token": self.token})
-        query = f"{relay_url.query}&{token_query}" if relay_url.query else token_query
+        query = urlencode([
+            (key, value) for key, value in parse_qsl(relay_url.query, keep_blank_values=True)
+            if key != "token"
+        ])
         url = relay_url._replace(query=query).geturl()
-        logger.info(f"Connecting to relay: {self.relay_url}")
+        logger.info("Connecting to relay: %s", relay_url.hostname)
 
-        async with websockets.connect(url, ping_interval=30, ping_timeout=10) as ws:
+        async with RelayConnect(
+            url,
+            additional_headers={"Authorization": f"Bearer {self.token}"},
+            ping_interval=30,
+            ping_timeout=10,
+            logger=transport_logger,
+        ) as ws:
             self._ws = ws
             try:
                 if self._stopping:
@@ -152,7 +184,7 @@ class BridgeAgent:
             finally:
                 self._ws = None
                 await self._cancel_pending_connects()
-                tasks = list(self._channel_tasks.values())
+                tasks = list(self._channel_workers)
                 for channel_id in set(self._channels) | set(self._channel_tasks):
                     await self._close_channel(channel_id)
                 if tasks:
@@ -231,15 +263,29 @@ class BridgeAgent:
 
     async def _handle_data(self, channel_id: str, data: bytes):
         """Forward data from relay to the local TCP connection."""
-        pair = self._channels.get(channel_id)
-        if not pair:
+        queue = self._channel_write_queues.get(channel_id)
+        if queue is None:
             return
-        _, writer = pair
         try:
-            writer.write(data)
-            await writer.drain()
-        except (ConnectionError, OSError):
-            await self._close_channel(channel_id)
+            queue.put_nowait(data)
+        except asyncio.QueueFull:
+            await self._close_channel(channel_id, flush_pending=False)
+        else:
+            await asyncio.sleep(0)
+
+    async def _forward_relay_to_tcp(self, channel_id, writer, queue):
+        try:
+            while True:
+                writer.write(await queue.get())
+                while not queue.empty():
+                    writer.write(queue.get_nowait())
+                await asyncio.wait_for(writer.drain(), timeout=TCP_WRITE_TIMEOUT)
+                if self._channel_write_queues.get(channel_id) is not queue:
+                    break
+        except (ConnectionError, OSError, asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        finally:
+            await self._close_channel(channel_id, flush_pending=False)
 
     async def _open_channel(self, channel_id: str, host: str, port: int):
         """Open a TCP connection to the target and start proxying."""
@@ -282,14 +328,25 @@ class BridgeAgent:
             return
 
         self._channels[channel_id] = (reader, writer)
+        queue = asyncio.Queue(maxsize=TCP_WRITE_QUEUE_MAXSIZE)
+        self._channel_write_queues[channel_id] = queue
 
         # Signal success
         await self._send_control({"type": "connected", "channel": channel_id})
+        if self._channels.get(channel_id) != (reader, writer):
+            return
         logger.info(f"Channel {channel_id[:8]}... opened to {target}")
+
+        write_task = asyncio.create_task(self._forward_relay_to_tcp(channel_id, writer, queue))
+        self._channel_write_tasks[channel_id] = write_task
+        self._channel_workers.add(write_task)
+        write_task.add_done_callback(self._channel_workers.discard)
 
         # Start forwarding local TCP -> relay
         task = asyncio.create_task(self._forward_tcp_to_relay(channel_id, reader))
         self._channel_tasks[channel_id] = task
+        self._channel_workers.add(task)
+        task.add_done_callback(self._channel_workers.discard)
 
     async def _forward_tcp_to_relay(self, channel_id: str, reader: asyncio.StreamReader):
         """Read from local TCP and send to relay as binary frames."""
@@ -306,24 +363,42 @@ class BridgeAgent:
         finally:
             await self._close_channel(channel_id)
 
-    async def _close_channel(self, channel_id: str):
+    async def _close_channel(self, channel_id: str, flush_pending: bool = True):
         """Close a tunnel channel and clean up."""
         pair = self._channels.pop(channel_id, None)
         task = self._channel_tasks.pop(channel_id, None)
-        if pair is None and task is None:
+        write_task = self._channel_write_tasks.pop(channel_id, None)
+        queue = self._channel_write_queues.pop(channel_id, None)
+        if pair is None and task is None and write_task is None:
             return
+
+        tasks = [
+            worker for worker in (task, write_task)
+            if worker and worker is not asyncio.current_task() and not worker.done()
+        ]
+        for worker in tasks:
+            worker.cancel()
 
         if pair:
             _, writer = pair
             try:
-                writer.close()
-                await writer.wait_closed()
+                try:
+                    if flush_pending and queue is not None:
+                        while not queue.empty():
+                            writer.write(queue.get_nowait())
+                finally:
+                    writer.close()
+                    await asyncio.wait_for(writer.wait_closed(), timeout=TCP_CLOSE_TIMEOUT)
+            except asyncio.TimeoutError:
+                writer.transport.abort()
+            except asyncio.CancelledError:
+                writer.transport.abort()
+                raise
             except Exception:
                 pass
 
-        if task and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         # Notify relay
         try:

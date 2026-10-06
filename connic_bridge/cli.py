@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import sys
+from urllib.parse import urlsplit
 
 from connic_bridge.agent import run_agent, validate_relay_url
 
@@ -90,8 +91,12 @@ def main():
         print("Use --allow host:port or set ALLOWED_HOSTS to restrict access.")
 
     # Run
+    relay_display_url = urlsplit(args.relay_url)
+    relay_display_url = relay_display_url._replace(
+        netloc=relay_display_url.netloc.rsplit("@", 1)[-1], query="", fragment=""
+    )
     print("Connic Bridge starting...")
-    print(f"  Relay:         {args.relay_url}")
+    print(f"  Relay:         {relay_display_url.geturl()}")
     print(f"  Allowed hosts: {', '.join(sorted(allowed_hosts)) or '(unrestricted)'}")
 
     asyncio.run(run_agent(args.relay_url, token, allowed_hosts))
