@@ -1,5 +1,5 @@
 """
-CLI entrypoint for Connic Bridge.
+CLI entrypoint for connic bridge.
 
 Usage:
     connic-bridge --token cbr_xxx --allow kafka:9092,postgres:5432
@@ -24,7 +24,7 @@ DEFAULT_RELAY_URL = "wss://relay.connic.co"
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Connic Bridge - connect private networks to Connic Cloud",
+        description="connic bridge - connect private networks to connic cloud",
     )
     parser.add_argument(
         "--token",
@@ -95,7 +95,7 @@ def main():
     relay_display_url = relay_display_url._replace(
         netloc=relay_display_url.netloc.rsplit("@", 1)[-1], query="", fragment=""
     )
-    print("Connic Bridge starting...")
+    print("connic bridge starting...")
     print(f"  Relay:         {relay_display_url.geturl()}")
     print(f"  Allowed hosts: {', '.join(sorted(allowed_hosts)) or '(unrestricted)'}")
 

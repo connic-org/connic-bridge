@@ -1,9 +1,9 @@
 """
-Connic Bridge - runs inside the customer's VPC.
+connic bridge - runs inside the customer's VPC.
 
-Establishes an outbound WebSocket connection to the Connic relay service
+Establishes an outbound WebSocket connection to the connic relay service
 and proxies TCP connections to private services (Kafka, PostgreSQL, etc.)
-on behalf of Connic connector workers.
+on behalf of connic connector workers.
 """
 import asyncio
 import json

@@ -1,8 +1,8 @@
-# Connic Bridge
+# connic bridge
 
-Connect your private infrastructure to Connic Cloud. The Connic Bridge runs
+Connect your private infrastructure to connic cloud. The connic bridge runs
 inside your network (VPC, on-prem, etc.) and creates a secure outbound tunnel
-to the Connic relay. No inbound firewall rules required.
+to the connic relay. No inbound firewall rules required.
 
 ## Quick Start
 
@@ -31,7 +31,7 @@ connic-bridge \
 
 | Option        | Env Var         | Description                                                 |
 | ------------- | --------------- | ----------------------------------------------------------- |
-| `--token`     | `BRIDGE_TOKEN`  | Bridge authentication token (from Connic dashboard)         |
+| `--token`     | `BRIDGE_TOKEN`  | Bridge authentication token (from connic dashboard)         |
 | `--relay-url` | `RELAY_URL`     | Relay URL (default: `wss://relay.connic.co`)                |
 | `--allow`     | `ALLOWED_HOSTS` | Optional `host:port` allowlist; if omitted, all network-reachable hosts are allowed |
 | `--log-level` | `LOG_LEVEL`     | `DEBUG`, `INFO`, `WARNING`, or `ERROR`                      |
@@ -39,9 +39,9 @@ connic-bridge \
 
 ## How It Works
 
-1. The Connic Bridge establishes an **outbound** WebSocket connection to the
-  Connic relay service. No inbound ports need to be opened.
-2. When a Connic connector (e.g. Kafka, PostgreSQL) needs to reach a private
+1. The connic bridge establishes an **outbound** WebSocket connection to the
+  connic relay service. No inbound ports need to be opened.
+2. When a connic connector (e.g. Kafka, PostgreSQL) needs to reach a private
   endpoint, the relay asks the bridge to open a TCP connection.
 3. If an allowed hosts list is configured, the bridge validates the target
   against it, then opens a local TCP connection and proxies data bidirectionally.
@@ -66,5 +66,5 @@ for setup instructions, API usage, supported patterns, and limits.
 - **Outbound-only** - the bridge never accepts inbound connections.
 - **Optional allowed hosts** - set an exact `host:port` allowlist to restrict
   access. Without one, the bridge can reach any host available from its network.
-- **Token authentication** - each bridge is tied to a single Connic project.
+- **Token authentication** - each bridge is tied to a single connic project.
 - **TLS encryption** - all relay communication uses WSS.

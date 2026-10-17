@@ -40,7 +40,7 @@ def test_cli_combines_allowed_hosts_from_environment_and_repeated_flags(monkeypa
         )
     ]
     output = capsys.readouterr().out
-    assert "Connic Bridge starting..." in output
+    assert "connic bridge starting..." in output
     assert "Relay:         wss://relay.internal.example" in output
     assert "cbr_legacy_url_token" not in output
     assert "Allowed hosts: kafka:9092, my-db:5432, postgres:5432, redis:6379" in output
@@ -144,5 +144,5 @@ def test_cli_run_as_main_executes_module_entrypoint(monkeypatch, capsys):
     runpy.run_module("connic_bridge.cli", run_name="__main__")
 
     out = capsys.readouterr().out
-    assert "Connic Bridge starting..." in out
+    assert "connic bridge starting..." in out
     assert ran == [("wss://module-relay.example", "cbr_from_main", {"db.internal:5432"})]

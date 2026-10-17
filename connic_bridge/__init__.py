@@ -1,2 +1,2 @@
-"""Connic Bridge - connects private networks to Connic Cloud."""
+"""connic bridge - connects private networks to connic cloud."""
 __version__ = "0.1.6"
