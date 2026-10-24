@@ -9,7 +9,7 @@ to the connic relay. No inbound firewall rules required.
 ### Docker (recommended)
 
 ```bash
-docker run -d --name connic-bridge \
+docker run -d --name connic-bridge --restart unless-stopped \
   -e BRIDGE_TOKEN=cbr_your_token_here \
   -e ALLOWED_HOSTS=kafka:9092,postgres:5432 \
   connicorg/bridge:latest
@@ -25,6 +25,13 @@ connic-bridge \
   --allow kafka:9092 \
   --allow postgres:5432
 ```
+
+The agent reconnects after network interruptions but exits when the relay
+rejects its token or the project has no active deployment. Run the pip agent
+under a service manager that starts it again, such as a macOS LaunchAgent with
+`KeepAlive` or a systemd unit with `Restart=always`. See
+[running the bridge as a service](https://connic.co/docs/v1/platform/bridge#run-as-service)
+for both files.
 
 ## Configuration
 

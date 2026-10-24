@@ -22,6 +22,17 @@ transport_logger.setLevel(logging.WARNING)
 TCP_WRITE_QUEUE_MAXSIZE = 16
 TCP_WRITE_TIMEOUT = 10.0
 TCP_CLOSE_TIMEOUT = 5.0
+# Per-channel flow control: each side announces how many data frames it
+# buffers per channel and returns credit as it writes them onward.
+WINDOW_HEADER = "X-Connic-Bridge-Window"
+
+
+def parse_window(value: Optional[str]) -> Optional[int]:
+    try:
+        window = int(value)
+    except (TypeError, ValueError):
+        return None
+    return window if window > 0 else None
 
 
 class RelayConnect(connect):
@@ -69,7 +80,12 @@ class BridgeAgent:
         self._channel_write_tasks: Dict[str, asyncio.Task] = {}
         self._channel_workers: Set[asyncio.Task] = set()
         self._pending_connect_tasks: Dict[str, asyncio.Task] = {}
+        # Frames the relay buffers per channel; None when it has no flow control.
+        self._relay_window: Optional[int] = None
+        self._send_credits: Dict[str, int] = {}
+        self._credit_available: Dict[str, asyncio.Event] = {}
         self._reconnect_task: Optional[asyncio.Task] = None
+        self._relay_connected = False
         self._running = False
         self._stopping = False
 
@@ -82,6 +98,7 @@ class BridgeAgent:
         delay = base_delay
 
         while self._running:
+            self._relay_connected = False
             try:
                 await self._connect_and_serve()
                 delay = base_delay  # Reset on clean disconnect
@@ -113,6 +130,8 @@ class BridgeAgent:
             except Exception as e:
                 logger.error(f"Unexpected error: {e}")
 
+            if self._relay_connected:
+                delay = base_delay  # Reset once a connection was established
             if self._running:
                 logger.info(f"Reconnecting in {delay}s...")
                 self._reconnect_task = asyncio.create_task(asyncio.sleep(delay))
@@ -154,12 +173,17 @@ class BridgeAgent:
 
         async with RelayConnect(
             url,
-            additional_headers={"Authorization": f"Bearer {self.token}"},
+            additional_headers={
+                "Authorization": f"Bearer {self.token}",
+                WINDOW_HEADER: str(TCP_WRITE_QUEUE_MAXSIZE),
+            },
             ping_interval=30,
             ping_timeout=10,
             logger=transport_logger,
         ) as ws:
             self._ws = ws
+            self._relay_connected = True
+            self._relay_window = parse_window(ws.response.headers.get(WINDOW_HEADER))
             try:
                 if self._stopping:
                     return
@@ -261,6 +285,21 @@ class BridgeAgent:
                 await self._cancel_pending_connects(channel_id)
                 await self._close_channel(channel_id)
 
+        elif msg_type == "window":
+            channel_id = ctrl.get("channel")
+            frames = ctrl.get("frames")
+            if (
+                channel_id in self._send_credits
+                and isinstance(frames, int)
+                and not isinstance(frames, bool)
+                and frames > 0
+            ):
+                self._send_credits[channel_id] = min(
+                    self._send_credits[channel_id] + frames,
+                    self._relay_window,
+                )
+                self._credit_available[channel_id].set()
+
     async def _handle_data(self, channel_id: str, data: bytes):
         """Forward data from relay to the local TCP connection."""
         queue = self._channel_write_queues.get(channel_id)
@@ -277,12 +316,25 @@ class BridgeAgent:
         try:
             while True:
                 writer.write(await queue.get())
+                frames = 1
                 while not queue.empty():
                     writer.write(queue.get_nowait())
+                    frames += 1
                 await asyncio.wait_for(writer.drain(), timeout=TCP_WRITE_TIMEOUT)
                 if self._channel_write_queues.get(channel_id) is not queue:
                     break
-        except (ConnectionError, OSError, asyncio.TimeoutError, asyncio.CancelledError):
+                await self._send_control({
+                    "type": "window",
+                    "channel": channel_id,
+                    "frames": frames,
+                })
+        except (
+            ConnectionError,
+            OSError,
+            asyncio.TimeoutError,
+            asyncio.CancelledError,
+            websockets.exceptions.ConnectionClosed,
+        ):
             pass
         finally:
             await self._close_channel(channel_id, flush_pending=False)
@@ -330,6 +382,9 @@ class BridgeAgent:
         self._channels[channel_id] = (reader, writer)
         queue = asyncio.Queue(maxsize=TCP_WRITE_QUEUE_MAXSIZE)
         self._channel_write_queues[channel_id] = queue
+        if self._relay_window is not None:
+            self._send_credits[channel_id] = self._relay_window
+            self._credit_available[channel_id] = asyncio.Event()
 
         # Signal success
         await self._send_control({"type": "connected", "channel": channel_id})
@@ -352,6 +407,8 @@ class BridgeAgent:
         """Read from local TCP and send to relay as binary frames."""
         try:
             while True:
+                # Wait for relay credit before reading so the target sees backpressure.
+                await self._take_send_credit(channel_id)
                 data = await reader.read(65536)
                 if not data:
                     break
@@ -363,12 +420,23 @@ class BridgeAgent:
         finally:
             await self._close_channel(channel_id)
 
+    async def _take_send_credit(self, channel_id: str):
+        available = self._credit_available.get(channel_id)
+        if available is None:
+            return
+        while self._send_credits.get(channel_id, 0) <= 0:
+            available.clear()
+            await available.wait()
+        self._send_credits[channel_id] -= 1
+
     async def _close_channel(self, channel_id: str, flush_pending: bool = True):
         """Close a tunnel channel and clean up."""
         pair = self._channels.pop(channel_id, None)
         task = self._channel_tasks.pop(channel_id, None)
         write_task = self._channel_write_tasks.pop(channel_id, None)
         queue = self._channel_write_queues.pop(channel_id, None)
+        self._send_credits.pop(channel_id, None)
+        self._credit_available.pop(channel_id, None)
         if pair is None and task is None and write_task is None:
             return
 

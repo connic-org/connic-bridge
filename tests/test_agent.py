@@ -23,9 +23,10 @@ TLS_PRIVATE_KEY = Path(__file__).parent / "fixtures" / "localhost-key.pem"
 
 
 class RelaySocket:
-    def __init__(self):
+    def __init__(self, response_headers=None):
         self.sent = []
         self.closed = False
+        self.response = Response(101, "Switching Protocols", Headers(response_headers or {}))
 
     async def send(self, message):
         self.sent.append(message)
@@ -507,6 +508,163 @@ def test_buffered_relay_burst_and_stop_preserve_all_tcp_bytes(monkeypatch):
         finally:
             stopping.cancel()
             await asyncio.gather(stopping, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+class QueueRelaySocket(RelaySocket):
+    def __init__(self, response_headers=None):
+        super().__init__(response_headers)
+        self.incoming = asyncio.Queue()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        message = await self.incoming.get()
+        if message is None:
+            raise StopAsyncIteration
+        return message
+
+
+def binary_frames(relay):
+    return [message for message in relay.sent if isinstance(message, bytes)]
+
+
+async def wait_for_binary_frames(relay, count):
+    for _ in range(100):
+        if len(binary_frames(relay)) >= count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"Timed out waiting for {count} TCP data frames")
+
+
+def test_target_reads_pause_until_relay_returns_window_credit(monkeypatch):
+    async def scenario():
+        service = IdleTcpService()
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", service.connect)
+        relay = QueueRelaySocket({"X-Connic-Bridge-Window": "3"})
+        monkeypatch.setattr(agent_module, "RelayConnect", lambda *_args, **_kwargs: relay)
+        agent = BridgeAgent("wss://relay.example", "cbr_test", set())
+        serving = asyncio.create_task(agent._connect_and_serve())
+        try:
+            await relay.incoming.put(json.dumps({
+                "type": "connect",
+                "channel": CHANNEL_ID,
+                "host": service.host,
+                "port": service.port,
+            }))
+            await asyncio.wait_for(service.connected.wait(), timeout=1)
+            for index in range(10):
+                await service._reader.feed_data(bytes([index]))
+
+            await wait_for_binary_frames(relay, 3)
+            await asyncio.sleep(0.05)
+            assert len(binary_frames(relay)) == 3
+
+            for credit in ({"frames": 0}, {"frames": True}, {"frames": "2"}, {}):
+                await relay.incoming.put(json.dumps({
+                    "type": "window",
+                    "channel": CHANNEL_ID,
+                    **credit,
+                }))
+            await asyncio.sleep(0.05)
+            assert len(binary_frames(relay)) == 3
+
+            await relay.incoming.put(json.dumps({
+                "type": "window",
+                "channel": CHANNEL_ID,
+                "frames": 2,
+            }))
+            await wait_for_binary_frames(relay, 5)
+            await asyncio.sleep(0.05)
+            assert binary_frames(relay) == [
+                CHANNEL_ID.encode("utf-8") + bytes([index]) for index in range(5)
+            ]
+        finally:
+            await relay.incoming.put(None)
+            await asyncio.wait_for(serving, timeout=1)
+            await agent.stop()
+            await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_relay_without_window_header_gets_frames_without_credit(monkeypatch):
+    async def scenario():
+        service = IdleTcpService()
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", service.connect)
+        relay = QueueRelaySocket()
+        monkeypatch.setattr(agent_module, "RelayConnect", lambda *_args, **_kwargs: relay)
+        agent = BridgeAgent("wss://relay.example", "cbr_test", set())
+        serving = asyncio.create_task(agent._connect_and_serve())
+        try:
+            await relay.incoming.put(json.dumps({
+                "type": "connect",
+                "channel": CHANNEL_ID,
+                "host": service.host,
+                "port": service.port,
+            }))
+            await asyncio.wait_for(service.connected.wait(), timeout=1)
+            for index in range(40):
+                await service._reader.feed_data(bytes([index]))
+
+            await wait_for_binary_frames(relay, 40)
+        finally:
+            await relay.incoming.put(None)
+            await asyncio.wait_for(serving, timeout=1)
+            await agent.stop()
+            await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_relay_data_written_to_target_returns_window_credit(monkeypatch):
+    async def scenario():
+        service = IdleTcpService()
+        drained = asyncio.Event()
+
+        class GatedWriter(IdleWriter):
+            async def drain(self):
+                await drained.wait()
+
+        async def connect(host, port):
+            reader, _ = await service.connect(host, port)
+            return reader, GatedWriter(service)
+
+        monkeypatch.setattr(agent_module.asyncio, "open_connection", connect)
+        relay = RelaySocket()
+        agent = BridgeAgent("wss://relay.example", "cbr_test", set())
+        agent._ws = relay
+        try:
+            await agent._handle_control({
+                "type": "connect",
+                "channel": CHANNEL_ID,
+                "host": service.host,
+                "port": service.port,
+            })
+            for payload in (b"one", b"two", b"three"):
+                await agent._handle_data(CHANNEL_ID, payload)
+            await asyncio.sleep(0)
+            assert [decode_control(m)["type"] for m in relay.sent] == ["connected"]
+
+            drained.set()
+            await wait_for_control(relay, "window")
+            credits = [
+                decode_control(message) for message in relay.sent
+                if decode_control(message)["type"] == "window"
+            ]
+            assert sum(credit["frames"] for credit in credits) == 3
+            assert {credit["channel"] for credit in credits} == {CHANNEL_ID}
+        finally:
+            await agent.stop()
+            await service.close()
 
     asyncio.run(scenario())
 
@@ -1141,6 +1299,7 @@ def test_connect_and_serve_without_allowlist_proxies_postgres_ssl_request_over_r
             try:
                 path = connection.request.path
                 authorization = connection.request.headers.get_all("Authorization")
+                window = connection.request.headers.get("X-Connic-Bridge-Window")
                 await connection.send(json.dumps({
                     "type": "welcome",
                     "bridge_id": "bridge_integration",
@@ -1154,14 +1313,22 @@ def test_connect_and_serve_without_allowlist_proxies_postgres_ssl_request_over_r
                 connected = decode_control(await connection.recv())
 
                 await connection.send(CHANNEL_ID.encode("utf-8") + ssl_request)
-                response_frame = await connection.recv()
+                credit = response_frame = None
+                while credit is None or response_frame is None:
+                    message = await connection.recv()
+                    if isinstance(message, bytes):
+                        response_frame = message
+                    else:
+                        credit = decode_control(message)
 
                 await connection.send(json.dumps({
                     "type": "close",
                     "channel": CHANNEL_ID,
                 }))
                 close = decode_control(await connection.recv())
-                relay_done.set_result((path, authorization, connected, response_frame, close))
+                relay_done.set_result(
+                    (path, authorization, window, connected, credit, response_frame, close)
+                )
             except Exception as error:
                 if not relay_done.done():
                     relay_done.set_exception(error)
@@ -1186,15 +1353,22 @@ def test_connect_and_serve_without_allowlist_proxies_postgres_ssl_request_over_r
                 )
                 agent_task = asyncio.create_task(agent._connect_and_serve())
 
-                path, authorization, connected, response_frame, close = await asyncio.wait_for(
-                    relay_done,
-                    timeout=2,
-                )
+                (
+                    path,
+                    authorization,
+                    window,
+                    connected,
+                    credit,
+                    response_frame,
+                    close,
+                ) = await asyncio.wait_for(relay_done, timeout=2)
                 await asyncio.wait_for(agent_task, timeout=2)
 
             request = await asyncio.wait_for(tcp_request, timeout=2)
             await asyncio.wait_for(tcp_closed.wait(), timeout=2)
             assert path == "/bridge?region=eu"
+            assert window == "16"
+            assert credit == {"type": "window", "channel": CHANNEL_ID, "frames": 1}
             assert authorization == (
                 ["Basic dXNlcjpwYXNzd29yZA==", "Bearer cbr_integration_token"]
                 if userinfo else ["Bearer cbr_integration_token"]
@@ -1642,6 +1816,45 @@ def test_run_resets_delay_after_clean_disconnect(monkeypatch):
         # Call 3: ConnectionError → sleep(4), delay doubles to 8
         # Without the reset after call 2, call 3 would have slept 8 instead of 4
         assert sleeps == [2, 2, 4]
+
+    asyncio.run(scenario())
+
+
+def test_run_resets_delay_after_established_connection_drops(monkeypatch):
+    async def scenario():
+        attempts = 0
+        sleeps = []
+        real_sleep = asyncio.sleep
+        agent = BridgeAgent("wss://relay.example", "cbr_test", set())
+
+        class UnreachableRelay(ScriptedRelaySocket):
+            async def __aenter__(self):
+                if attempts == 5:
+                    agent._running = False
+                raise ConnectionRefusedError("relay unavailable")
+
+        class DroppedRelay(ScriptedRelaySocket):
+            async def __anext__(self):
+                close = Close(1011, "Relay restarting")
+                raise websockets.exceptions.ConnectionClosedError(close, close, True)
+
+        def relay_connect(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            return DroppedRelay([]) if attempts == 3 else UnreachableRelay([])
+
+        async def fast_sleep(seconds):
+            sleeps.append(seconds)
+            await real_sleep(0)
+
+        monkeypatch.setattr(agent_module.asyncio, "sleep", fast_sleep)
+        monkeypatch.setattr(agent_module, "RelayConnect", relay_connect)
+
+        await agent.run()
+
+        assert attempts == 5
+        # The third attempt connected, so its drop retries at the base delay.
+        assert sleeps == [2, 4, 2, 4]
 
     asyncio.run(scenario())
 
